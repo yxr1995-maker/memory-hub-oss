@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from scripts.automation_core.operation import (
+    AutomationLock,
+    GitBaseline,
+    LockBusy,
+    OwnedPath,
+    begin_transaction,
+    commit_exact,
+    rollback_transaction,
+    stage_exact,
+)
+from scripts.automation_core.schema import Mode, OperationContext
+from tests.helpers.full_auto_fixture import write_page
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+
+
+class OperationFixture:
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+        self.repo = tmp_path / "wiki"
+        self.data = tmp_path / "data"
+        self.repo.mkdir(parents=True, exist_ok=True)
+        self.data.mkdir(parents=True, exist_ok=True)
+        self.operation_id = "20260831T000000Z-op-test"
+
+        # Init git repo
+        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.repo, check=True)
+
+        # Baseline commit
+        write_page(self.repo, "init.md", {}, "init\n")
+        subprocess.run(["git", "add", "init.md"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.repo, check=True)
+
+        # Seed index.db
+        (self.data / "index.db").write_text("index-data", encoding="utf-8")
+
+    def operation(self, op_id: str | None = None) -> OperationContext:
+        return OperationContext(
+            operation_id=op_id or self.operation_id,
+            command="maintain",
+            mode=Mode.AUTO,
+            auto=True,
+            apply=True,
+            wiki_path=self.repo,
+            data_path=self.data,
+        )
+
+    def lock(self, pid: int, age_minutes: float = 0.0) -> None:
+        lock_dir = self.data / "locks" / "automation.lock"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        info = {
+            "pid": pid,
+            "host": "localhost",
+            "operation_id": "prior-op",
+            "start_monotonic": 0.0,
+            "start_utc": "2026-08-31T00:00:00Z",
+        }
+        (lock_dir / "info.json").write_text(str(info).replace("'", '"'), encoding="utf-8")
+        if age_minutes > 0:
+            mtime = os.path.getmtime(str(lock_dir)) - (age_minutes * 60.0 + 10)
+            os.utime(str(lock_dir / "info.json"), (mtime, mtime))
+            os.utime(str(lock_dir), (mtime, mtime))
+
+    def acquire(self) -> AutomationLock:
+        return AutomationLock.acquire(self.data, self.operation())
+
+    def stage_user_file(self, rel: str) -> None:
+        write_page(self.repo, rel, {}, "user content\n")
+        subprocess.run(["git", "add", rel], cwd=self.repo, check=True)
+
+    def transaction(self) -> Any:
+        baseline = GitBaseline.capture(self.repo)
+        return begin_transaction(self.operation(), baseline)
+
+    def next_transaction(self) -> Any:
+        baseline = GitBaseline.capture(self.repo)
+        return begin_transaction(self.operation("next-op"), baseline)
+
+    def cached_paths(self) -> list[str]:
+        out = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=self.repo, capture_output=True, text=True).stdout
+        return [l.strip() for l in out.splitlines() if l.strip()]
+
+    def owned(self, rel: str, content: str = "content\n") -> OwnedPath:
+        target = write_page(self.repo, rel, {}, content)
+        return OwnedPath(rel, sha256_file(target))
+
+
+@pytest.fixture
+def operation_fixture(tmp_path: Path) -> OperationFixture:
+    return OperationFixture(tmp_path)
+
+
+def test_live_lock_exits_75_and_stale_dead_lock_is_archived(operation_fixture: OperationFixture) -> None:
+    operation_fixture.lock(pid=os.getpid(), age_minutes=31.0)
+    with pytest.raises(LockBusy) as exc_info:
+        operation_fixture.acquire()
+    assert exc_info.value.exit_code == 75
+
+    operation_fixture.lock(pid=999_999, age_minutes=31.0)
+    acquired = operation_fixture.acquire()
+    assert acquired.operation_id == operation_fixture.operation_id
+    assert list((operation_fixture.data / "locks" / "archive").iterdir())
+
+
+def test_preexisting_staged_safely_blocks_operation_without_index_or_git_mutation(operation_fixture: OperationFixture) -> None:
+    operation_fixture.stage_user_file("user.md")
+    before_index = sha256_file(operation_fixture.data / "index.db")
+    tx = operation_fixture.transaction()
+    report = stage_exact(operation_fixture.repo, tx, [operation_fixture.owned("new.md")])
+    assert report.result == "preexisting_staged"
+    assert operation_fixture.cached_paths() == ["user.md"]
+    assert sha256_file(operation_fixture.data / "index.db") == before_index
+
+
+def test_empty_baseline_requires_cached_to_equal_verified_whitelist(operation_fixture: OperationFixture) -> None:
+    tx = operation_fixture.transaction()
+    report = stage_exact(operation_fixture.repo, tx, [operation_fixture.owned("new.md")])
+    assert report.result == "exact"
+    assert operation_fixture.cached_paths() == ["new.md"]
+    commit_report = commit_exact(operation_fixture.repo, tx, report)
+    assert commit_report.result == "committed"
+    assert operation_fixture.cached_paths() == []
+
+    # Racing modification / unverified extra file staged while baseline was clean
+    tx2 = operation_fixture.next_transaction()
+    operation_fixture.stage_user_file("racer.md")
+    failed = stage_exact(operation_fixture.repo, tx2, [operation_fixture.owned("next.md")])
+    assert failed.result == "whitelist_mismatch"
+    assert "next.md" not in operation_fixture.cached_paths()
+
+
+def test_non_ascii_paths_round_trip_through_exact_staging(operation_fixture: OperationFixture) -> None:
+    """git quotes non-ASCII paths unless -z is used; staging must still compare exactly."""
+    rel = "atoms/2022-08-18/合伙企业投资退出方式-4bcaf2.md"
+    tx = operation_fixture.transaction()
+    report = stage_exact(operation_fixture.repo, tx, [operation_fixture.owned(rel)])
+    assert report.result == "exact"
+    cached = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "-z"], cwd=operation_fixture.repo,
+        capture_output=True, text=True, errors="surrogateescape",
+    ).stdout
+    assert [p for p in cached.split("\0") if p] == [rel]
+
+
+def test_rollback_reverts_only_this_operation_commit(operation_fixture: OperationFixture) -> None:
+    tx = operation_fixture.transaction()
+    report = stage_exact(operation_fixture.repo, tx, [operation_fixture.owned("owned.md")])
+    commit_report = commit_exact(operation_fixture.repo, tx, report)
+    assert commit_report.result == "committed"
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD~1"],
+        cwd=operation_fixture.repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    rollback_transaction(tx)
+
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=operation_fixture.repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == baseline
+    assert not (operation_fixture.repo / "owned.md").exists()
+
+
+def test_rollback_preserves_later_external_commit(operation_fixture: OperationFixture) -> None:
+    tx = operation_fixture.transaction()
+    report = stage_exact(operation_fixture.repo, tx, [operation_fixture.owned("owned.md")])
+    commit_report = commit_exact(operation_fixture.repo, tx, report)
+    assert commit_report.result == "committed"
+
+    # A human/another process commits after the failed operation.
+    write_page(operation_fixture.repo, "external.md", {}, "external\n")
+    subprocess.run(["git", "add", "external.md"], cwd=operation_fixture.repo, check=True)
+    subprocess.run(["git", "commit", "-m", "external"], cwd=operation_fixture.repo, check=True)
+    external_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=operation_fixture.repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    rollback_transaction(tx)
+
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=operation_fixture.repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == external_head
+    assert (operation_fixture.repo / "external.md").read_text(encoding="utf-8").endswith("external\n")
+    assert (operation_fixture.repo / "owned.md").exists()
+
+
+def test_commit_hook_failure_leaves_no_operation_staging(operation_fixture: OperationFixture) -> None:
+    hook = operation_fixture.repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    tx = operation_fixture.transaction()
+    report = stage_exact(operation_fixture.repo, tx, [operation_fixture.owned("owned.md")])
+    assert report.result == "exact"
+    with pytest.raises(RuntimeError, match="git commit failed"):
+        commit_exact(operation_fixture.repo, tx, report)
+    assert operation_fixture.cached_paths() == []
+    assert (operation_fixture.repo / "owned.md").is_file()
+
+
+def test_rollback_reports_conflict_when_later_commit_touched_owned_file(operation_fixture: OperationFixture) -> None:
+    tx = operation_fixture.transaction()
+    page = operation_fixture.repo / "init.md"
+    original = page.read_bytes()
+    tx.journal.save_before_images([page])
+    page.write_bytes(b"operation edit\n")
+    # External history modifies the same file after the operation snapshot.
+    subprocess.run(["git", "add", "init.md"], cwd=operation_fixture.repo, check=True)
+    subprocess.run(["git", "commit", "-m", "external edit"], cwd=operation_fixture.repo, check=True, capture_output=True)
+    external_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=operation_fixture.repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    report = rollback_transaction(tx)
+
+    assert not report.restored
+    assert report.conflict_paths == (str(page.absolute()),)
+    assert page.read_bytes() == b"operation edit\n"  # untouched: external commit wins
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=operation_fixture.repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == external_head
+    assert original != b"operation edit\n"

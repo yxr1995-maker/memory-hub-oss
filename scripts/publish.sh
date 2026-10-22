@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# memory-hub publish: staging/pages -> ~/llm-wiki 按 type 映射目录 + 更新 index.md / log.md
+# 默认 dry-run（只预览不写入）; --apply 才落盘。永不覆盖已存在页面。
+# 对齐 openwiki OKF / gbrain 规范: frontmatter 校验 + 目录映射 + log 防重复
+set -euo pipefail
+
+HUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGING="${MEMORY_HUB_STAGING:-$HUB_DIR/staging}"
+PAGES_DIR="$STAGING/pages"
+source "$HUB_DIR/scripts/lib.sh"
+timing_begin
+trap 'timing_end publish "$?"' EXIT
+WIKI="${WIKI_PATH:-$HOME/llm-wiki}"
+APPLY=0
+COMMIT=0
+ACCEPT_CANDIDATE=""
+
+# 判断页面是否 memoryhub 蒸馏页
+is_memoryhub() {
+  grep -q '^  - memoryhub$' "$1"
+}
+
+# type -> 目录 映射
+type_dir() {
+  if is_memoryhub "$2"; then
+    echo "drafts/memoryhub"
+    return
+  fi
+  case "$1" in
+    decision) echo "decisions" ;;
+    failure) echo "failures" ;;
+    concept) echo "concepts" ;;
+    query) echo "queries" ;;
+    entity) echo "entities" ;;
+    comparison) echo "comparisons" ;;
+    moc) echo "moc" ;;
+    *) echo "queries" ;;
+  esac
+}
+
+candidate_target() {
+  local f="$1" rel
+  [[ "$(grep -c '^conflict_target:' "$f")" == 1 ]] || return 1
+  rel="$(sed -n 's/^conflict_target: *//p' "$f" | tr -d "'")"
+  [[ -n "$rel" && "$rel" != /* && "/$rel/" != *'/../'* && "/$rel/" != *'/archive/'* ]] || return 1
+  printf '%s\n' "$rel"
+}
+
+replace_target() {
+  python3 "$HUB_DIR/scripts/secure_replace.py" "$WIKI" "$2" "$1"
+}
+
+# 稳定页面 ID：发布前保证 staging 页有 id；覆盖已有 wiki 页时沿用其 id（永不替换已有 id）
+ensure_page_id() {
+  MH_ID_SRC="$1" MH_ID_TARGET="$2" PYTHONPATH="$HUB_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
+import os
+from pathlib import Path
+from scripts.automation_core.frontmatter import parse_page, patch_frontmatter
+from scripts.automation_core.id_backfill import new_page_id
+src = Path(os.environ["MH_ID_SRC"]); target = Path(os.environ["MH_ID_TARGET"])
+doc = parse_page(src)
+cur = str(doc.frontmatter.get("id") or "").strip()
+want = cur
+if target.is_file() and not target.is_symlink():
+    try:
+        old = str(parse_page(target).frontmatter.get("id") or "").strip()
+    except ValueError:
+        old = ""  # 旧页无 frontmatter：无 id 可沿用
+    if old:
+        want = old
+if not want:
+    want = new_page_id()
+if want != cur:
+    src.write_bytes(patch_frontmatter(doc, {"id": want}))
+print(want)
+PY
+}
+
+# 发布后校验：本次发布页的 id 在 wiki 范围内唯一
+check_ids_unique() {
+  local id n
+  for id in "$@"; do
+    [[ -n "$id" ]] || continue
+    n="$(grep -rlx --include='*.md' -e "id: $id" -e "id: '$id'" -e "id: \"$id\"" "$WIKI" 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$n" != 1 ]]; then
+      echo "错误: 页面 id 不唯一: $id ($n 处)" >&2
+      return 1
+    fi
+  done
+}
+
+usage() {
+  echo "用法: publish.sh [--apply] [--commit] [--accept-candidate <slug>]"
+  echo "  默认 dry-run: 预览待发布页面、frontmatter 校验、目录映射"
+  echo "  --commit: --apply 基础上，在 ~/llm-wiki 中 git add + commit 本次发布内容"
+  echo "  --accept-candidate <slug>: 仅与 --apply 一起使用；确认后发布指定 candidate 并覆盖同名 memoryhub 页"
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --dry-run) APPLY=0 ;;
+    --commit) COMMIT=1 ;;
+    --accept-candidate) [[ $# -ge 2 ]] || { echo "错误: --accept-candidate 需要 slug" >&2; exit 2; }; ACCEPT_CANDIDATE="$2"; shift ;;
+    --help|-h) usage ;;
+    *) echo "未知参数: $1" >&2; usage ;;
+  esac
+  shift
+done
+
+[[ -z "$ACCEPT_CANDIDATE" || "$APPLY" == 1 ]] || { echo "错误: --accept-candidate 需要 --apply" >&2; exit 2; }
+
+[[ -d "$WIKI" ]] || { echo "错误: 知识库不存在: $WIKI (WIKI_PATH=$WIKI)" >&2; exit 1; }
+
+if [[ -n "$ACCEPT_CANDIDATE" ]]; then
+  [[ "$ACCEPT_CANDIDATE" != */* && "$ACCEPT_CANDIDATE" == *.md && -f "$PAGES_DIR/$ACCEPT_CANDIDATE" ]] \
+    || { echo "错误: candidate 不存在于 staging/pages: $ACCEPT_CANDIDATE" >&2; exit 2; }
+  [[ "$(sed -n 's/^status: *//p' "$PAGES_DIR/$ACCEPT_CANDIDATE" | tr -d "'")" == "candidate" ]] \
+    || { echo "错误: 不是 candidate: $ACCEPT_CANDIDATE" >&2; exit 2; }
+fi
+
+shopt -s nullglob
+PAGES=("$PAGES_DIR"/*.md)
+if [[ -n "$ACCEPT_CANDIDATE" ]]; then
+  # 显式单条审批：只处理指定文件，不连带发布其他 staging 页（M6 评审 #2）
+  PAGES=("$PAGES_DIR/$ACCEPT_CANDIDATE")
+fi
+[[ ${#PAGES[@]} -gt 0 ]] || { echo "publish: 无待发布页面"; exit 0; }
+
+REQUIRED_FIELDS="title type created tags sources abstract id"
+
+# —— frontmatter 校验 ——
+VALID_PAGES=()
+for f in "${PAGES[@]}"; do
+  MISSING=""
+  # 旧 staging 页（id 上线前蒸馏）无 id：--apply 时先补发 pg-<ULID>，dry-run 只提示
+  if ! grep -q "^id:" "$f"; then
+    if [[ "$APPLY" == 1 ]]; then
+      ensure_page_id "$f" "/nonexistent" >/dev/null || { echo "错误: 页面 id 处理失败: $(basename "$f")" >&2; exit 1; }
+    else
+      echo "publish: [dry-run] $(basename "$f") 无 id，发布时将分配 pg-<ULID>"
+    fi
+  fi
+  for field in $REQUIRED_FIELDS; do
+    [[ "$field" == id && "$APPLY" == 0 ]] && continue
+    grep -q "^${field}:" "$f" || MISSING="$MISSING $field"
+  done
+  if [[ -n "$MISSING" ]]; then
+    echo "publish: [跳过] $(basename "$f") 缺 frontmatter 字段:$MISSING"
+  else
+    VALID_PAGES+=("$f")
+  fi
+done
+
+if [[ ${#VALID_PAGES[@]} -eq 0 ]]; then
+  echo "publish: 无通过校验的页面"
+  exit 0
+fi
+
+if [[ "$APPLY" == 0 ]]; then
+  echo "publish: [dry-run] 以下 ${#VALID_PAGES[@]} 页将通过校验:"
+  for f in "${VALID_PAGES[@]}"; do
+    T="$(sed -n 's/^type: *//p' "$f" | tr -d "'")"
+    DIR="$(type_dir "$T" "$f")"
+    echo "  + $DIR/$(basename "$f") (type=$T)"
+  done
+  echo "publish: [dry-run] index.md / log.md 将相应更新"
+  if [[ "$COMMIT" == 1 ]]; then
+    echo "publish: [dry-run] 将执行 --commit（git add + commit 本次发布内容）"
+    echo "publish: 确认无误后运行: publish.sh --apply --commit"
+  else
+    echo "publish: 确认无误后运行: publish.sh --apply（或 memory-hub.sh run --apply）"
+  fi
+  exit 0
+fi
+
+# —— 落盘 ——
+COPIED=0
+TRACKED=()
+mkdir -p "$STAGING/published"
+PUBLISHED_IDS=()
+LOG_ENTRIES=""
+for f in "${VALID_PAGES[@]}"; do
+  SLUG="$(basename "$f")"
+  T="$(sed -n 's/^type: *//p' "$f" | tr -d "'")"
+  DIR="$(type_dir "$T" "$f")"
+  TARGET="$WIKI/$DIR/$SLUG"
+  MH=0
+  is_memoryhub "$f" && MH=1
+  STAT="$(sed -n 's/^status: *//p' "$f" | tr -d "'")"
+  REL_TARGET=""
+  if [[ "$STAT" == "candidate" && "$SLUG" != "$ACCEPT_CANDIDATE" ]]; then
+    echo "publish: [conflict, 未发布] $DIR/$SLUG (status: candidate, 见 reports/conflicts/)"
+    continue
+  fi
+  if [[ "$STAT" == "candidate" ]]; then
+    [[ "$MH" == 1 ]] || { echo "错误: candidate 必须是 memoryhub 页面: $SLUG" >&2; exit 2; }
+    REL_TARGET="$(candidate_target "$f")" || { echo "错误: candidate conflict_target 非法: $SLUG" >&2; exit 2; }
+    TARGET="$WIKI/$REL_TARGET"
+    echo "publish: [candidate, 已确认] $TARGET"
+  fi
+  PAGE_ID="$(ensure_page_id "$f" "$TARGET")" || { echo "错误: 页面 id 处理失败: $SLUG" >&2; exit 1; }
+  PUBLISHED_IDS+=("$PAGE_ID")
+  if [[ "$MH" == 1 ]]; then
+    if [[ "$STAT" == "candidate" ]]; then
+      replace_target "$f" "$REL_TARGET" || { echo "错误: candidate 覆盖失败: $SLUG" >&2; exit 1; }
+    else
+      mkdir -p "$WIKI/$DIR"
+      cp "$f" "$TARGET"
+    fi
+    mv "$f" "$STAGING/published/$SLUG"
+    TRACKED+=("$SLUG|$DIR|$REL_TARGET|$STAT")
+    COPIED=$((COPIED + 1))
+    echo "publish: + $DIR/$SLUG (memoryhub, 覆盖更新)"
+  else
+    if [[ -f "$TARGET" ]]; then
+      echo "publish: 跳过(已存在): $DIR/$SLUG"
+      continue
+    fi
+    mkdir -p "$WIKI/$DIR"
+    cp "$f" "$TARGET"
+    mv "$f" "$STAGING/published/$SLUG"
+    TRACKED+=("$SLUG|$DIR||$STAT")
+    COPIED=$((COPIED + 1))
+    echo "publish: + $DIR/$SLUG"
+    if ! grep -qF "发布 $SLUG" "$WIKI/log.md" 2>/dev/null; then
+      LOG_ENTRIES+="- $(date '+%Y-%m-%d %H:%M') 发布 $SLUG ($T)"$'\n'
+    fi
+  fi
+done
+
+if [[ "$COPIED" -gt 0 ]]; then
+  check_ids_unique "${PUBLISHED_IDS[@]:-}" || exit 1
+fi
+
+# 追加 log.md（防重复）
+if [[ -n "$LOG_ENTRIES" ]]; then
+  printf '%s' "$LOG_ENTRIES" >> "$WIKI/log.md"
+fi
+
+# index.md 更新（对应分区段头后插入新页行）
+if [[ "$COPIED" -gt 0 ]]; then
+  # 运维蒸馏区只在 index.md 登记一次
+  if ! grep -qF "[[drafts/memoryhub]]" "$WIKI/index.md" 2>/dev/null; then
+    echo "- [[drafts/memoryhub]] — memoryhub 运维蒸馏区" >> "$WIKI/index.md"
+  fi
+  INDEX_FILE="$(mktemp)"
+  for PUB in "$STAGING"/published/*.md; do
+    [[ -f "$PUB" ]] || continue
+    SLUG="$(basename "$PUB" .md)"
+    T="$(sed -n 's/^type: *//p' "$PUB" | tr -d "'")"
+    DIR="$(type_dir "$T" "$PUB")"
+    TITLE="$(sed -n 's/^title: //p' "$PUB" | tr -d "'")"
+    if is_memoryhub "$PUB"; then
+      continue
+    fi
+    if [[ -f "$WIKI/$DIR/$SLUG.md" ]] && ! grep -qF "[[$DIR/$SLUG]]" "$WIKI/index.md" 2>/dev/null; then
+      echo "- [[$DIR/$SLUG]] — ${TITLE:-memory-hub 蒸馏}" >> "$INDEX_FILE"
+    fi
+  done
+  if [[ -s "$INDEX_FILE" ]]; then
+    # 在 index.md 尾部追加新页行（不更新旧行，只补新页；避免破坏现有结构）
+    cat "$INDEX_FILE" >> "$WIKI/index.md"
+  fi
+  rm -f "$INDEX_FILE"
+fi
+
+printf '%s\n' "${TRACKED[@]:-}" | sed '/^$/d' > "$STAGING/.published-this-run"
+echo "publish: MH_PUBLISHED=${#TRACKED[@]}"
+echo "publish: 完成，发布 $COPIED 页; index.md / log.md 已更新"
+echo "publish: gbrain 索引源即 ~/llm-wiki，新页会被自动纳入检索"
+
+# --commit: 在 ~/llm-wiki 中只 add 本次发布涉及的文件，提交归属清楚的 commit
+if [[ "$COMMIT" == 1 ]]; then
+  cd "$WIKI" || { echo "publish: [commit] 无法进入 $WIKI"; exit 1; }
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "publish: [commit] $WIKI 不是 git 仓库，跳过提交"
+    exit 0
+  fi
+  # ponytail: 精确 add 而非 add -A，避免把 .obsidian/、.tmp、他人改动带入 commit
+  ADD_FILES=()
+  for PUB in "$STAGING"/published/*.md; do
+    [[ -f "$PUB" ]] || continue
+    SLUG="$(basename "$PUB" .md)"
+    T="$(sed -n 's/^type: *//p' "$PUB" | tr -d "'")"
+    DIR="$(type_dir "$T" "$PUB")"
+    TARGET="$WIKI/$DIR/$SLUG.md"
+    [[ -f "$TARGET" ]] || continue
+    ADD_FILES+=("$DIR/$SLUG.md")
+  done
+  # index.md / log.md：publish 逻辑已写入这两文件，直接提交
+  ADD_FILES+=("index.md" "log.md")
+  git add -- "${ADD_FILES[@]}" 2>/dev/null || true
+  HASH="$(git commit -m "feat(memoryhub): 蒸馏发布 ${#ADD_FILES[@]} 文件" 2>/dev/null || true)"
+  if [[ -n "$HASH" ]]; then
+    echo "publish: [commit] $HASH"
+    git diff --cached --stat 2>/dev/null
+  else
+    echo "publish: [commit] 无变更或提交失败"
+  fi
+fi

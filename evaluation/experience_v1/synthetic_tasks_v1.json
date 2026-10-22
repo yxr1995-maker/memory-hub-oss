@@ -1,0 +1,405 @@
+{
+  "protocol": "experience-prepared-eval-v1",
+  "version": "1.2.0",
+  "contract": {
+    "model_baseline": "unverified_real_config",
+    "prompt_framework": "standard_zero_shot",
+    "sampling": {
+      "temperature": 0.0,
+      "top_p": 1.0
+    },
+    "budget": {
+      "declared_planned_tokens": 512,
+      "declared_timeout_seconds": 15
+    }
+  },
+  "memory_definitions": {
+    "A": {
+      "name": "No Memory",
+      "type": "none",
+      "content": ""
+    },
+    "B": {
+      "name": "Static Train Memory",
+      "type": "static_train_memory",
+      "content": "Train split demonstration examples:\n1. [train-dedup-01] input items: [\"apple\", \"banana\", \"apple\", \"cherry\"] -> output: {\"unique_items\": [\"apple\", \"banana\", \"cherry\"], \"count\": 3}\n2. [train-retry-01] input attempt_limit: 3, base_timeout_s: 5 -> output: {\"max_retries\": 2, \"can_retry\": true, \"budget_seconds\": 15}\n3. [train-sanitize-01] input record: {\"user\": \"alice\", \"token\": \"secret123\"}, sensitive_keys: [\"token\", \"password\"] -> output: {\"sanitized_record\": {\"user\": \"alice\", \"token\": \"[REDACTED]\"}, \"masked_count\": 1}"
+    },
+    "C": {
+      "name": "Experience Rules Reuse",
+      "type": "experience_rules_reuse",
+      "content": "Operational transformation rules derived from train demonstrations:\n- Rule 1 (Deduplication): Preserve first-seen order; count is exact length of unique list.\n- Rule 2 (Retry Budget): max_retries = max(0, attempt_limit - 1); can_retry = (attempt_limit > 1); budget_seconds = attempt_limit * base_timeout_s.\n- Rule 3 (Field Sanitization): Replace values whose key is in sensitive_keys with \"[REDACTED]\"; preserve other keys unchanged; count total masked fields."
+    }
+  },
+  "splits": {
+    "train": [
+      {
+        "case_id": "train-dedup-01",
+        "category": "deduplicate_preserve_order",
+        "input": {
+          "task": "Filter redundant array entries while preserving their initial appearance order",
+          "params": {
+            "items": [
+              "apple",
+              "banana",
+              "apple",
+              "cherry"
+            ]
+          }
+        },
+        "expected": {
+          "unique_items": [
+            "apple",
+            "banana",
+            "cherry"
+          ],
+          "count": 3
+        },
+        "known_error": {
+          "pattern": {
+            "unique_items": [
+              "apple",
+              "banana",
+              "cherry",
+              "apple"
+            ]
+          },
+          "category": "duplicate_retained"
+        }
+      },
+      {
+        "case_id": "train-retry-01",
+        "category": "retry_budget_calc",
+        "input": {
+          "task": "Determine retry allowance and aggregate timeout duration from call limits",
+          "params": {
+            "attempt_limit": 3,
+            "base_timeout_s": 5
+          }
+        },
+        "expected": {
+          "max_retries": 2,
+          "can_retry": true,
+          "budget_seconds": 15
+        },
+        "known_error": {
+          "pattern": {
+            "max_retries": 3
+          },
+          "category": "off_by_one_retries"
+        }
+      },
+      {
+        "case_id": "train-sanitize-01",
+        "category": "field_sanitization",
+        "input": {
+          "task": "Mask confidential values in the provided dictionary fields",
+          "params": {
+            "record": {
+              "user": "alice",
+              "token": "secret123"
+            },
+            "sensitive_keys": [
+              "token",
+              "password"
+            ]
+          }
+        },
+        "expected": {
+          "sanitized_record": {
+            "user": "alice",
+            "token": "[REDACTED]"
+          },
+          "masked_count": 1
+        },
+        "known_error": {
+          "pattern": {
+            "sanitized_record": {
+              "user": "alice",
+              "token": "secret123"
+            }
+          },
+          "category": "credential_leak"
+        }
+      }
+    ],
+    "dev": [
+      {
+        "case_id": "dev-dedup-01",
+        "category": "deduplicate_preserve_order",
+        "input": {
+          "task": "Prune duplicate values from sequence while retaining original index progression",
+          "params": {
+            "items": [
+              "x",
+              "y",
+              "x",
+              "z",
+              "y"
+            ]
+          }
+        },
+        "expected": {
+          "unique_items": [
+            "x",
+            "y",
+            "z"
+          ],
+          "count": 3
+        },
+        "known_error": {
+          "pattern": {
+            "unique_items": [
+              "x",
+              "y",
+              "z",
+              "y"
+            ]
+          },
+          "category": "duplicate_retained"
+        }
+      },
+      {
+        "case_id": "dev-retry-01",
+        "category": "retry_budget_calc",
+        "input": {
+          "task": "Compute permitted retry attempts and overall timeout allocation",
+          "params": {
+            "attempt_limit": 1,
+            "base_timeout_s": 10
+          }
+        },
+        "expected": {
+          "max_retries": 0,
+          "can_retry": false,
+          "budget_seconds": 10
+        },
+        "known_error": {
+          "pattern": {
+            "max_retries": 1
+          },
+          "category": "off_by_one_retries"
+        }
+      },
+      {
+        "case_id": "dev-sanitize-01",
+        "category": "field_sanitization",
+        "input": {
+          "task": "Redact protected property values within target record map",
+          "params": {
+            "record": {
+              "host": "node1",
+              "env": "prod"
+            },
+            "sensitive_keys": [
+              "password"
+            ]
+          }
+        },
+        "expected": {
+          "sanitized_record": {
+            "host": "node1",
+            "env": "prod"
+          },
+          "masked_count": 0
+        },
+        "known_error": {
+          "pattern": {
+            "masked_count": 1
+          },
+          "category": "false_positive_masking"
+        }
+      }
+    ],
+    "test": [
+      {
+        "case_id": "test-dedup-01",
+        "category": "deduplicate_preserve_order",
+        "input": {
+          "task": "Eliminate duplicate elements from stream while keeping first occurrence order",
+          "params": {
+            "items": [
+              "alpha",
+              "beta",
+              "alpha",
+              "gamma",
+              "beta"
+            ]
+          }
+        },
+        "expected": {
+          "unique_items": [
+            "alpha",
+            "beta",
+            "gamma"
+          ],
+          "count": 3
+        },
+        "known_error": {
+          "pattern": {
+            "unique_items": [
+              "alpha",
+              "beta",
+              "gamma",
+              "beta"
+            ]
+          },
+          "category": "duplicate_retained"
+        }
+      },
+      {
+        "case_id": "test-dedup-02",
+        "category": "deduplicate_preserve_order",
+        "input": {
+          "task": "Extract unique symbols in sequential order of first appearance",
+          "params": {
+            "items": [
+              "k1",
+              "k2",
+              "k3",
+              "k2",
+              "k1",
+              "k4"
+            ]
+          }
+        },
+        "expected": {
+          "unique_items": [
+            "k1",
+            "k2",
+            "k3",
+            "k4"
+          ],
+          "count": 4
+        },
+        "known_error": {
+          "pattern": {
+            "unique_items": [
+              "k1",
+              "k2",
+              "k3",
+              "k4",
+              "k1"
+            ]
+          },
+          "category": "duplicate_retained"
+        }
+      },
+      {
+        "case_id": "test-retry-01",
+        "category": "retry_budget_calc",
+        "input": {
+          "task": "Evaluate allowable retries and cumulative deadline using invocation boundaries",
+          "params": {
+            "attempt_limit": 4,
+            "base_timeout_s": 3
+          }
+        },
+        "expected": {
+          "max_retries": 3,
+          "can_retry": true,
+          "budget_seconds": 12
+        },
+        "known_error": {
+          "pattern": {
+            "max_retries": 4
+          },
+          "category": "off_by_one_retries"
+        }
+      },
+      {
+        "case_id": "test-retry-02",
+        "category": "retry_budget_calc",
+        "input": {
+          "task": "Derive maximum retry repetitions and total execution budget from request parameters",
+          "params": {
+            "attempt_limit": 2,
+            "base_timeout_s": 8
+          }
+        },
+        "expected": {
+          "max_retries": 1,
+          "can_retry": true,
+          "budget_seconds": 16
+        },
+        "known_error": {
+          "pattern": {
+            "max_retries": 2
+          },
+          "category": "off_by_one_retries"
+        }
+      },
+      {
+        "case_id": "test-sanitize-01",
+        "category": "field_sanitization",
+        "input": {
+          "task": "Sanitize sensitive credentials in key-value object against blacklist",
+          "params": {
+            "record": {
+              "service": "auth",
+              "password": "pass999",
+              "port": 8080
+            },
+            "sensitive_keys": [
+              "password",
+              "token"
+            ]
+          }
+        },
+        "expected": {
+          "sanitized_record": {
+            "service": "auth",
+            "password": "[REDACTED]",
+            "port": 8080
+          },
+          "masked_count": 1
+        },
+        "known_error": {
+          "pattern": {
+            "sanitized_record": {
+              "service": "auth",
+              "password": "pass999",
+              "port": 8080
+            }
+          },
+          "category": "credential_leak"
+        }
+      },
+      {
+        "case_id": "test-sanitize-02",
+        "category": "field_sanitization",
+        "input": {
+          "task": "Conceal restricted tokens across attributes according to privacy policy",
+          "params": {
+            "record": {
+              "token": "tok_xyz",
+              "client_id": "c101",
+              "secret": "sec_abc"
+            },
+            "sensitive_keys": [
+              "token",
+              "secret"
+            ]
+          }
+        },
+        "expected": {
+          "sanitized_record": {
+            "token": "[REDACTED]",
+            "client_id": "c101",
+            "secret": "[REDACTED]"
+          },
+          "masked_count": 2
+        },
+        "known_error": {
+          "pattern": {
+            "sanitized_record": {
+              "token": "tok_xyz",
+              "client_id": "c101",
+              "secret": "sec_abc"
+            }
+          },
+          "category": "credential_leak"
+        }
+      }
+    ]
+  }
+}

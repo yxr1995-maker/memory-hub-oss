@@ -1,0 +1,409 @@
+"""Deterministic cross-day observation clustering and atomic manifest updates."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import tempfile
+from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .frontmatter import PageDocument
+from .operation import TransactionContext
+from .codex_memory import clean_text
+from .schema import normalize_id
+
+
+GENERATOR = "memory-hub-cluster"
+
+_LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+# Shell test brackets ([[ $# -eq 0 ]]) must never render as wikilinks.
+_SHELL_CHARS = frozenset("$\"!*?\\\\<>(){}=;&|" + chr(96))
+
+
+@dataclass(frozen=True)
+class ClusterObservation:
+    id: str
+    project_id: str
+    text: str
+    created_at_epoch: int
+    created_at_date: str
+    source_uri: str = ""
+    agent_id: str | None = None
+    cwd_hash: str = ""
+
+
+def member_link(member: ClusterObservation, is_page=None) -> str | None:
+    """Resolve a member to a wikilink target, or None when it must degrade.
+
+    is_page, when given, gates the candidate: unresolvable targets degrade
+    to the short-hash form instead of producing a dead link.
+    """
+    candidate = None
+    src = (member.source_uri or "").strip()
+    if src:
+        target = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*", "", src).lstrip("/")
+        for prefix in ("~/llm-wiki/", "llm-wiki/", "wiki/"):
+            if target.startswith(prefix):
+                target = target[len(prefix):]
+                break
+        if target.endswith(".md"):
+            target = target[:-3]
+        if target:
+            candidate = target
+    if candidate is None:
+        for match in _LINK_RE.finditer(member.text):
+            target = match.group(1).strip()
+            if target and not any(ch in _SHELL_CHARS for ch in target):
+                candidate = target
+                break
+    if candidate is None:
+        return None
+    if is_page is not None and not is_page(candidate):
+        return None
+    return candidate
+
+
+_TIMESTAMP_PREFIXES = (b"created:", b"updated:", b"valid_at:")
+
+
+def _frontmatter_head(raw: bytes) -> bytes:
+    if not raw.startswith(b"---\n"):
+        return b""
+    idx = raw.find(b"\n---\n", 3)
+    return raw[:idx] if idx >= 0 else raw
+
+
+def _strip_cluster_timestamps(raw: bytes) -> bytes:
+    head = _frontmatter_head(raw)
+    if not head:
+        return raw
+    kept = [ln for ln in head.split(b"\n") if not ln.strip().startswith(_TIMESTAMP_PREFIXES)]
+    return b"\n".join(kept) + raw[len(head):]
+
+
+def classify_cluster_target(target: Path, content: bytes, entry: ManifestEntry | None = None) -> str:
+    """Return 'write' | 'idempotent' | 'rewrite' | 'manual' for a cluster target.
+
+    Timestamp-only drift on a generator-marked page replays as idempotent
+    (no write, no report). A generator-marked page with substantive changes
+    is machine-owned and safe to regenerate. Anything without the generator
+    marker is treated as manually edited: skip and report.
+    """
+    if not target.exists():
+        return "write"
+    try:
+        current = target.read_bytes()
+    except OSError:
+        return "manual"
+    if current == content:
+        return "idempotent"
+    head = _frontmatter_head(current)
+    if ("generator: " + GENERATOR).encode() not in head:
+        return "manual"
+    if entry is not None:
+        match = re.search(rb"^cluster_key:\s*(\S+)", head, re.MULTILINE)
+        if match and match.group(1).decode() != entry.cluster_key:
+            return "manual"
+    if _strip_cluster_timestamps(current) == _strip_cluster_timestamps(content):
+        return "idempotent"
+    return "rewrite"
+
+
+@dataclass(frozen=True)
+class ClusterPlan:
+    key: str
+    scope_id: str
+    members: tuple[ClusterObservation, ...]
+    method: str
+    abstract: str
+    first_time: str
+    last_time: str
+
+
+@dataclass(frozen=True)
+class ManifestEntry:
+    cluster_key: str
+    observation_hashes: list[str]
+    page_path: str
+    content_hash: str
+    operation_id: str
+    created_at: str
+
+
+@dataclass
+class ClusterManifest:
+    entries: dict[str, ManifestEntry] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "entries": {
+                k: {
+                    "cluster_key": v.cluster_key,
+                    "observation_hashes": v.observation_hashes,
+                    "page_path": v.page_path,
+                    "content_hash": v.content_hash,
+                    "operation_id": v.operation_id,
+                    "created_at": v.created_at,
+                }
+                for k, v in self.entries.items()
+            },
+        }
+
+
+@dataclass(frozen=True)
+class ManifestResult:
+    result: str  # "committed" | "manifest_skip"
+
+
+def load_manifest(path: Path) -> ClusterManifest:
+    if not path.is_file():
+        return ClusterManifest()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries = {}
+        for k, v in data.get("entries", {}).items():
+            entries[k] = ManifestEntry(
+                cluster_key=v.get("cluster_key", k),
+                observation_hashes=v.get("observation_hashes", []),
+                page_path=v.get("page_path", ""),
+                content_hash=v.get("content_hash", ""),
+                operation_id=v.get("operation_id", ""),
+                created_at=v.get("created_at", ""),
+            )
+        return ClusterManifest(entries)
+    except Exception:
+        return ClusterManifest()
+
+
+def _sanitize_obs_text(text: str) -> str:
+    # Reuse the hardened pipeline sanitizer; keep only the path masking that
+    # is specific to wiki provenance rules.
+    cleaned = re.sub(r"ghp_[A-Za-z0-9]{36}", "[REDACTED_SECRET]", clean_text(text))
+    return re.sub(r"/(?:Users|home)/[A-Za-z0-9._-]+", "/[REDACTED_PATH]", cleaned).strip()
+
+
+def scan_observations(staging: Path, manifest: ClusterManifest) -> tuple[ClusterObservation, ...]:
+    results = []
+    seen_ids: set[str] = set()
+    if not staging.is_dir():
+        return ()
+
+    consumed_hashes = set()
+    for entry in manifest.entries.values():
+        consumed_hashes.update(entry.observation_hashes)
+
+    pattern = re.compile(r"^observations-\d{8}-\d{6}\.jsonl$")
+    for f in sorted(staging.iterdir()):
+        if not pattern.match(f.name):
+            continue
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                d = json.loads(line)
+                obs_id = str(d.get("id") or "")
+                dedupe_key = str(d.get("provenance_id") or "") or obs_id
+                if not dedupe_key:
+                    continue
+                obs_hash = hashlib.sha256(dedupe_key.encode()).hexdigest()
+                if obs_hash in consumed_hashes:
+                    continue
+
+                text = _sanitize_obs_text(str(d.get("text") or ""))
+                if not (20 <= len(text) <= 2000):
+                    continue
+
+                # Unnamed projects are invalid input: routing them to a shared
+                # bucket silently mixes unrelated observations, so drop them.
+                if not str(d.get("project_id") or d.get("project") or "").strip():
+                    continue
+                proj = normalize_id(str(d.get("project_id") or d.get("project")), "default-project")
+                epoch = int(d.get("created_at_epoch", 0))
+                if epoch > 10**12:
+                    epoch //= 1000
+                if epoch > 10**10:
+                    epoch = 0
+                date_str = datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d") if epoch else "unknown"
+
+                # Duplicate observations collapse to one cluster member;
+                # keep the first occurrence deterministically.
+                if dedupe_key in seen_ids:
+                    continue
+                seen_ids.add(dedupe_key)
+
+                results.append(
+                    ClusterObservation(
+                        id=obs_id,
+                        project_id=proj,
+                        text=text,
+                        created_at_epoch=epoch,
+                        created_at_date=date_str,
+                        source_uri=str(d.get("source_uri") or ""),
+                        agent_id=d.get("agent_id"),
+                        cwd_hash=str(d.get("cwd_hash") or ""),
+                    )
+                )
+        except Exception:
+            continue
+    return tuple(results)
+
+
+def _jaccard_3gram(s1: str, s2: str) -> float:
+    g1 = {s1[i:i+3] for i in range(len(s1) - 2)}
+    g2 = {s2[i:i+3] for i in range(len(s2) - 2)}
+    if not g1 or not g2:
+        return 0.0
+    return len(g1.intersection(g2)) / len(g1.union(g2))
+
+
+def cluster_observations(
+    observations: Sequence[ClusterObservation],
+    embeddings: Any | None = None,
+) -> tuple[ClusterPlan, ...]:
+    buckets: dict[str, list[ClusterObservation]] = defaultdict(list)
+    for obs in observations:
+        buckets[obs.project_id].append(obs)
+
+    plans: list[ClusterPlan] = []
+    for scope_id, items in sorted(buckets.items()):
+        if len(items) < 3:
+            continue
+        try:
+            max_per_project = int(os.environ.get("MEMORY_HUB_CLUSTER_MAX_OBS", "500"))
+        except ValueError:
+            max_per_project = 500
+        if max_per_project < 3:
+            max_per_project = 500
+        if len(items) > max_per_project:
+            items = sorted(items, key=lambda item: (item.created_at_epoch, item.id))[:max_per_project]
+
+        use_embedding = bool(embeddings and (callable(getattr(embeddings, "cosine", None)) or callable(getattr(embeddings, "similarity", None))))
+        method = "embedding" if use_embedding else "local"
+        clusters: list[list[ClusterObservation]] = []
+        for item in items:
+            placed = False
+            for c in clusters:
+                if use_embedding:
+                    if callable(getattr(embeddings, "cosine", None)):
+                        sim = embeddings.cosine()
+                    else:
+                        sim = embeddings.similarity(item, c[0])
+                    threshold = 0.80
+                else:
+                    sim = _jaccard_3gram(item.text, c[0].text)
+                    threshold = 0.52
+                if sim >= threshold:
+                    c.append(item)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([item])
+
+        for c in clusters:
+            if len(c) < 3:
+                continue
+            dates = {item.created_at_date for item in c if item.created_at_date != "unknown"}
+            if len(dates) < 2:
+                continue
+            epochs = [item.created_at_epoch for item in c if item.created_at_epoch > 0]
+            if epochs and (max(epochs) - min(epochs)) > (45 * 86400):
+                continue
+
+            sorted_ids = sorted(item.id for item in c)
+            key = hashlib.sha256(chr(10).join(sorted_ids).encode("utf-8")).hexdigest()[:16]
+
+            first_t = datetime.fromtimestamp(min(epochs), timezone.utc).isoformat() if epochs else ""
+            last_t = datetime.fromtimestamp(max(epochs), timezone.utc).isoformat() if epochs else ""
+            abstract = c[0].text[:160]
+
+            plans.append(
+                ClusterPlan(
+                    key=key,
+                    scope_id=scope_id,
+                    members=tuple(c),
+                    method=method,
+                    abstract=abstract,
+                    first_time=first_t,
+                    last_time=last_t,
+                )
+            )
+
+    return tuple(sorted(plans, key=lambda p: p.key))
+
+
+def render_merge_page(cluster: ClusterPlan, now: datetime | None = None, is_page=None) -> bytes:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    now_iso = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    frontmatter = [
+        "---",
+        "type: moc",
+        f"generator: {GENERATOR}",
+        f"title: '合并记忆: {cluster.scope_id} ({cluster.key})'",
+        "status: active",
+        "scope: project",
+        f"scope_id: {cluster.scope_id}",
+        f"cluster_key: {cluster.key}",
+        f"member_count: {len(cluster.members)}",
+        f"method: {cluster.method}",
+        f"first_observed: '{cluster.first_time}'",
+        f"last_observed: '{cluster.last_time}'",
+        f"valid_at: '{now_iso}'",
+        f"created: '{now_iso[:10]}'",
+        f"updated: '{now_iso[:10]}'",
+        "abstract: '" + cluster.abstract.replace("\n", " ").replace("\r", " ").replace("'", "''") + "'",
+        "---",
+        f"# 合并记忆: {cluster.scope_id}",
+        "",
+        f"## 概述\n- 跨日聚类产生 ({cluster.method}, 成员数 {len(cluster.members)})\n- 待核实：自动聚类整理，未作独立事实核验。\n- 关键词: {cluster.abstract}\n",
+        "## 观察明细",
+    ]
+    for m in cluster.members:
+        link = member_link(m, is_page)
+        if link:
+            frontmatter.append(f"- [[{link}]] ({m.created_at_date}) {m.text}")
+        else:
+            short = hashlib.sha256(m.id.encode("utf-8")).hexdigest()[:12]
+            frontmatter.append(f"- [{short}] ({m.created_at_date}) {m.text}")
+
+    return chr(10).join(frontmatter).encode("utf-8") + b"\n"
+
+
+def commit_manifest(
+    path: Path,
+    update: ManifestEntry,
+    tx: TransactionContext,
+) -> ManifestResult:
+    if "INDEX_SWAPPED" not in tx.journal.checkpoints:
+        raise ValueError("Cannot commit manifest before INDEX_SWAPPED")
+    if tx.operation.command == "maintain" and "LINT_PASSED" not in tx.journal.checkpoints:
+        raise ValueError("Cannot commit maintenance manifest before LINT_PASSED")
+
+    current = load_manifest(path)
+    if update.cluster_key in current.entries:
+        return ManifestResult("manifest_skip")
+
+    tx.journal.save_before_images([path])
+    current.entries[update.cluster_key] = update
+
+    tx.inject("manifest.before_replace")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = path.parent / f".{path.name}.tmp"
+    with temp_file.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(current.to_dict(), indent=2))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(str(temp_file), 0o600)
+    os.replace(str(temp_file), str(path))
+    tx.inject("manifest.after_replace")
+
+    tx.journal.checkpoint("MANIFEST_COMMITTED")
+    return ManifestResult("committed")

@@ -1,0 +1,85 @@
+staging/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local research, reports, and agent-run artifacts. These may contain private
+# session material and are deliberately not part of the distributable source.
+.omo/
+reports/
+aml_research/
+memos_research/
+evaluation/
+visualizations/
+competition.md
+docs.md
+evaluation.md
+mem0-report.md
+mem0-tech-notes.md
+.worktrees/
+
+# Runtime state produced by local runs (never source)
+.since
+.opencode/
+data/
+ui/node_modules/
+ui/dashboard/node_modules/
+
+# Keep experience evaluator source and synthetic development fixtures reviewable.
+!evaluation/
+evaluation/*
+!evaluation/experience_v1/
+evaluation/experience_v1/*
+!evaluation/experience_v1/development.jsonl
+!evaluation/experience_v1/harness.py
+!evaluation/experience_v1/runner.py
+!evaluation/experience_v1/actions.py
+!evaluation/experience_v1/m2.py
+!evaluation/experience_v1/diagnostics.py
+!evaluation/experience_v1/mock_eval.py
+!evaluation/experience_v1/mock_fixtures.json
+!evaluation/experience_v1/MOCK_EVALUATION.md
+!evaluation/experience_v1/prepared_eval.py
+!evaluation/experience_v1/synthetic_tasks_v1.json
+!evaluation/experience_v1/PREPARED_EVALUATION.md
+!evaluation/experience_v1/continuity.py
+!evaluation/experience_v1/continuity-suite.json
+!evaluation/experience_v1/paired_host.py
+!evaluation/experience_v1/paired-host-suite.json
+
+# Frozen experiment payloads: multi-GB runtime evidence (cells, snapshots, sqlite).
+# Kept on disk for audit; deliberately not part of the source tree.
+docs/evidence/
+!evaluation/experience_v1/m4_semantic.py
+!evaluation/experience_v1/m4_paraphrase.jsonl
+!evaluation/experience_v1/m4_multimodal.py
+!evaluation/experience_v1/m4_caption.jsonl
+!evaluation/experience_v1/m4_utility.py
+!evaluation/experience_v1/m4_utility.jsonl
+!evaluation/experience_v1/transfer-suite.json
+!evaluation/wikiskill/
+
+# Local environments, configuration, and private runtime artifacts.
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.codegraph
+.superpowers/
+.memory-hub/
+llm-wiki/
+demo/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+access.jsonl
+timings.tsv
+*.bak
+*.bak-*
+*.pem
+*.key

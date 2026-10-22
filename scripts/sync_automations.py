@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Sync Codex automation file layer (.toml) with SQLite DB layer."""
+import json
+import os
+import sqlite3
+import sys
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
+
+DB_PATH = Path.home() / ".codex" / "sqlite" / "codex-dev.db"
+AUTO_DIR = Path.home() / ".codex" / "automations"
+
+HUB_ROOT = Path(__file__).resolve().parents[1]
+WIKI_ROOT = Path(os.environ.get("WIKI_PATH") or (Path.home() / "llm-wiki"))
+# Legacy checkouts recorded absolute paths in the automation DB. Resolve them at
+# write time instead of hardcoding any one machine's layout: MEMORY_HUB_HUB /
+# WIKI_PATH override, otherwise $HOME/memory-hub and $HOME/llm-wiki.
+AUTHOR_ROOT = os.environ.get("MEMORY_HUB_HUB") or str(Path.home() / "memory-hub")
+AUTHOR_WIKI = os.environ.get("WIKI_PATH") or str(WIKI_ROOT)
+
+
+def localize(value):
+    """Rewrite legacy checkout paths recorded in the automation DB to this machine's.
+
+    A plain string, list or dict is handled so prompts, cwds and TOML text keep working.
+    """
+    if isinstance(value, str):
+        return value.replace(AUTHOR_ROOT, str(HUB_ROOT)).replace(AUTHOR_WIKI, str(WIKI_ROOT))
+    if isinstance(value, dict):
+        return {key: localize(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [localize(item) for item in value]
+    return value
+
+
+def now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def backup_db():
+    ts = int(datetime.now(timezone.utc).timestamp())
+    backup_path = Path(f"/tmp/codex-dev-before-memoryhub-{ts}.db")
+    con = sqlite3.connect(DB_PATH)
+    con.execute(f"VACUUM INTO '{backup_path}'")
+    con.close()
+    print(f"backup: {backup_path}")
+
+
+def parse_toml(path: Path) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def get_db_automation(cur, auto_id: str):
+    cur.execute("SELECT id, name, prompt, status, rrule, model, reasoning_effort, "
+                "cwds, target_type, project_id, created_at, updated_at "
+                "FROM automations WHERE id=?", (auto_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return dict(zip(["id", "name", "prompt", "status", "rrule", "model",
+                     "reasoning_effort", "cwds", "target_type", "project_id",
+                     "created_at", "updated_at"], row))
+
+
+def update_or_create(cur, data: dict):
+    existing = get_db_automation(cur, data["id"])
+    ts = now_ms()
+    target_type = data.get("target", {}).get("type", "project")
+    project_id = data.get("target", {}).get("project_id", "")
+    cwds = data.get("cwds", [])
+    if isinstance(cwds, str):
+        cwds = json.loads(cwds)
+    if existing:
+        cur.execute("""UPDATE automations SET
+            name=?, prompt=?, status=?, rrule=?, model=?, reasoning_effort=?,
+            cwds=?, target_type=?, project_id=?, updated_at=?
+            WHERE id=?""", (
+            data["name"], data["prompt"], data["status"], data["rrule"],
+            data.get("model"), data.get("reasoning_effort"),
+            json.dumps(cwds), target_type, project_id, ts, data["id"]))
+        print(f"updated DB: {data['id']} ({len(data['prompt'])} chars)")
+    else:
+        created = data.get("created_at", ts)
+        cur.execute("""INSERT INTO automations
+            (id, name, prompt, status, rrule, model, reasoning_effort,
+             cwds, target_type, project_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+            data["id"], data["name"], data["prompt"], data["status"], data["rrule"],
+            data.get("model"), data.get("reasoning_effort"),
+            json.dumps(cwds), target_type, project_id, created, ts))
+        print(f"created DB: {data['id']} ({len(data['prompt'])} chars)")
+
+
+MEMORY_HUB_TOML_TEMPLATE = '''version = 1
+id = "memory-hub"
+kind = "cron"
+name = "memory-hub 每日全链路"
+prompt = """跑 __HUB_ROOT__/memory-hub.sh run --apply --llm --commit，完成一次全链路记忆治理：采集 -> 蒸馏 -> 发布 -> 提交 -> 索引。
+
+步骤：
+1. cd __HUB_ROOT__
+2. ./memory-hub.sh run --apply --llm --commit
+3. 检查退出码：非 0 则报告错误并停止。
+4. 输出简洁中文摘要：采集条目数、蒸馏页数、发布到 llm-wiki 的页数、commit hash、索引状态。
+
+边界：只动 memory-hub 和 llm-wiki 相关文件；不做任何对外发布。"""
+status = "ACTIVE"
+rrule = "RRULE:FREQ=DAILY;BYHOUR=10;BYMINUTE=0;BYSECOND=0"
+model = "agnes/agnes-2.5-flash"
+reasoning_effort = "high"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "project", project_id = "33bba037-406a-46a2-a0bf-bede378cdb74" }
+cwds = ["__HUB_ROOT__"]
+'''
+
+MEMORY_HUB_TOML = MEMORY_HUB_TOML_TEMPLATE.replace("__HUB_ROOT__", str(HUB_ROOT))
+
+
+def main():
+    backup_db()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    changed = []
+    for auto_id in ["wiki-distill", "wiki-review", "llm-wiki-curation", "gbrain"]:
+        toml_path = AUTO_DIR / auto_id / "automation.toml"
+        if not toml_path.exists():
+            print(f"missing file: {toml_path}")
+            continue
+        data = parse_toml(toml_path)
+        data["id"] = auto_id
+        db = get_db_automation(cur, auto_id)
+        if not db:
+            print(f"missing DB: {auto_id}")
+            continue
+        if db["prompt"] != data["prompt"] or db["name"] != data["name"]:
+            changed.append(auto_id)
+            update_or_create(cur, data)
+        else:
+            print(f"unchanged: {auto_id}")
+
+    memory_hub_toml = AUTO_DIR / "memory-hub" / "automation.toml"
+    if not memory_hub_toml.exists():
+        memory_hub_toml.parent.mkdir(parents=True, exist_ok=True)
+        memory_hub_toml.write_text(localize(MEMORY_HUB_TOML), encoding="utf-8")
+        print(f"created file: {memory_hub_toml}")
+    data = parse_toml(memory_hub_toml)
+    data["id"] = "memory-hub"
+    if not get_db_automation(cur, "memory-hub"):
+        changed.append("memory-hub")
+        update_or_create(cur, data)
+    else:
+        print("memory-hub already exists in DB")
+
+    con.commit()
+    con.close()
+    print(f"\nchanged: {changed}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

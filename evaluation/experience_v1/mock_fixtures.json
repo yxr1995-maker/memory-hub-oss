@@ -1,0 +1,26 @@
+{
+  "protocol": "experience-mock-abcs-1",
+  "fixture_type": "synthetic_fixture",
+  "cases": [
+    {
+      "case_id": "synthetic-timeout-rule",
+      "task": "What timeout should this API use?",
+      "expected_terms": ["timeout", "10 seconds"],
+      "answers": {
+        "A": "The API is configured for retries.",
+        "B": "Requests have a timeout of 10 seconds.",
+        "C": "Keep the API timeout at 10 seconds."
+      }
+    },
+    {
+      "case_id": "synthetic-private-data-rule",
+      "task": "What should the response do with SQLite content?",
+      "expected_terms": ["do not expose", "sqlite content"],
+      "answers": {
+        "A": "Return a concise response.",
+        "B": "SQLite queries expose the stored content.",
+        "C": "Do not expose SQLite content in the response."
+      }
+    }
+  ]
+}

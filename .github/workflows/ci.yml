@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test:
+    name: Tests & Static Verification
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+        python-version: [ '3.11', '3.12' ]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep jq sqlite3
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ripgrep jq sqlite3 || true
+
+      # The macOS image ships an sqlite3 CLI without FTS5 and Homebrew's build is keg-only,
+      # so scripts/index.sh failed with "no such module: fts5" until PATH was corrected.
+      - name: Prefer an sqlite3 with FTS5 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list sqlite3 >/dev/null 2>&1 || brew install sqlite3
+          echo "$(brew --prefix sqlite3)/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the sqlite3 CLI has FTS5
+        run: |
+          sqlite3 --version
+          sqlite3 :memory: "create virtual table t using fts5(a); insert into t values ('ok');"
+
+      - name: Install test dependencies
+        run: python3 -m pip install -r requirements-test.txt
+
+      - name: Check Python syntax
+        run: |
+          python3 -m py_compile scripts/*.py scripts/automation_core/*.py tests/*.py tests/helpers/*.py
+
+      - name: Check Bash syntax (per file)
+        run: |
+          set -e
+          for f in memory-hub.sh scripts/*.sh tests/*.sh; do bash -n "$f"; done
+
+      - name: Run full test suite (pytest collects pytest + unittest cases)
+        run: |
+          OPENCODEX_URL=http://127.0.0.1:1/v1 python3 -m pytest -q tests/ --disable-warnings --maxfail=5
+
+      - name: Run script-style regression suites
+        run: |
+          set -e
+          python3 tests/test_candidate_flow.py
+          python3 tests/test_verify_tokens.py
+          python3 tests/test_full_auto_cli.py --evidence-dir "${{ runner.temp }}/full-auto-evidence"
+
+      - name: Run status & verify consistency checks
+        run: |
+          bash tests/test_status_verify_consistency.sh

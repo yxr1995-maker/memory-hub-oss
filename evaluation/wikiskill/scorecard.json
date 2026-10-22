@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "scope": "WikiSkill P0 single-skill atomic proposal evaluation",
+  "as_of": "2026-09-26",
+  "sources": {
+    "google_original_mechanism": {
+      "citation": "arXiv:2608.27454",
+      "rules": [
+        "single_skill_atomic_change",
+        "strict_improvement_R_val_gt_R_best",
+        "asymmetric_rollback_skill_only",
+        "reasoning_must_not_read_wiki",
+        "retain_proposal_diff_score_and_decision_ledger"
+      ]
+    },
+    "local_extension": {
+      "rules": [
+        "compression_guard",
+        "command_echo_guard",
+        "paired_host_gate_fields"
+      ]
+    }
+  },
+  "metrics": {
+    "retrieval": {
+      "hit_at_5": {
+        "source": "scripts/eval.py",
+        "floor": 0.5,
+        "comparison": ">=",
+        "required": true
+      },
+      "mrr": {
+        "source": "scripts/eval.py",
+        "floor": 0.2,
+        "comparison": ">=",
+        "required": true
+      },
+      "ratio": {
+        "source": "scripts/eval.py compare_expansion",
+        "floor": 0.9,
+        "comparison": ">=",
+        "required": true
+      },
+      "passed": {
+        "source": "scripts/eval.py",
+        "meaning": "eval harness pass result",
+        "required": true
+      }
+    },
+    "paired_host_gate": {
+      "source": "evaluation/experience_v1/paired-host-suite.json:gate",
+      "required": true,
+      "fields": [
+        "two_semantic_improvements_over_B",
+        "engineering_C_at_least_B",
+        "creative_intent_C_at_least_B",
+        "no_factual_regression",
+        "negative_transfer_all_pass"
+      ]
+    },
+    "local_red_lines": {
+      "compression_guard": {
+        "source": "local extension",
+        "required": true,
+        "status": "pending_threshold",
+        "parameters": {
+          "max_compression_ratio": null,
+          "min_retained_trace_chars": null
+        },
+        "description": "Reject candidates that over-compress trace content (for example 24002 to 694); thresholds remain configurable and must be calibrated."
+      },
+      "command_echo_guard": {
+        "source": "local extension",
+        "required": true,
+        "status": "active",
+        "forbidden_patterns": [
+          "^\\s*(?:\\$|>)\\s+",
+          "(?:^|\\n)\\s*(?:bash|python3?|git|sed|rg|cat|find)\\s+"
+        ],
+        "description": "Reject command or shell prompt residue in the candidate skill output."
+      }
+    }
+  },
+  "decision": {
+    "states": ["accepted", "rejected", "rolled_back"],
+    "acceptance": [
+      "all required metrics and paired-host gates pass",
+      "compression_guard passes",
+      "command_echo_guard passes",
+      "R_val > R_best",
+      "one atomic skill change with proposal, diff, score, and decision record"
+    ],
+    "rollback": {
+      "skill": "revertable",
+      "wiki": "not_reverted",
+      "source": "Google original mechanism"
+    }
+  },
+  "artifacts": {
+    "candidate_required": ["pattern_source", "proposal", "diff", "score"],
+    "result_required": ["candidate_id", "decision", "reason", "recorded_at"]
+  }
+}

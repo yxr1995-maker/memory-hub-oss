@@ -1,0 +1,1412 @@
+import sys, pathlib
+_ROOT = str(pathlib.Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path: sys.path.insert(0, _ROOT)
+from scripts.automation_core.query_planner import SearchRequest
+from scripts.automation_core.service import MemoryService
+#!/usr/bin/env python3
+"""memory-hub REST server (stdlib only): 供外部 agent 查询记忆向量/知识库。
+
+用法:
+  server.py [--port 8787] [--host 127.0.0.1]
+
+路由:
+  GET /health   存活探针
+  GET /status   健康统计（status.sh）
+  GET /search?q=...&top=3&expand=1   检索（search.sh）
+  GET /ask?q=...&top=5&expand=1      问答（ask.sh）
+  GET /metrics  Prometheus 文本（metrics.sh）
+
+ 管理 API（供 codex++ 用户脚本 ui/memory-hub-admin.js 使用，全部 JSON + CORS）:
+  GET    /api/overview                总览统计（页面/观察/索引/耗时）
+  GET    /api/pages?type=&tag=&q=&offset=&limit=   页面列表（frontmatter 元数据，分页）
+  GET    /api/page?path=              页面全文 + 解析后的 frontmatter
+  POST   /api/page  {path, content}   写入页面（限 wiki 内 .md，≤2MB）
+  GET    /api/pending                 待审池（staging candidate + experience review + wiki candidate）
+  POST   /api/review {source, id, decision}  审批/驳回（candidate|experience|page × approve|reject）
+  DELETE /api/page?path=              移入 ~/.memory-hub/trash（可恢复，不真删）
+  GET    /api/tags                    标签聚合计数
+  GET    /api/observations?q=&project=&offset=&limit=  staging 原始观察（新→旧，分页）
+"""
+import argparse
+import ipaddress
+import socket
+import glob
+import json
+import os
+import pathlib
+import re
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+HUB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WIKI = os.environ.get("WIKI_PATH", os.path.expanduser("~/llm-wiki"))
+DATA_DIR = os.environ.get("MEMORY_HUB_DATA", os.path.expanduser("~/.memory-hub"))
+TRASH_DIR = os.path.join(DATA_DIR, "trash")
+STAGING = os.environ.get("MEMORY_HUB_STAGING", os.path.join(HUB, "staging"))
+SESSIONS_DIR = os.environ.get("CODEX_SESSIONS_DIR", os.path.expanduser("~/.codex/sessions"))
+MAX_BODY = 2 * 1024 * 1024
+EXCLUDE_DIRS = {"raw", "_legacy-para", "_archive"}
+EXPERIENCE_DB = os.environ.get("MEMORY_HUB_EXPERIENCE_DB",
+                               os.path.join(DATA_DIR, "experience.sqlite3"))
+ACCESS_LOG = os.path.join(DATA_DIR, "access.jsonl")
+ACCESS_MAX = 2 * 1024 * 1024  # 超过则轮转为 .1
+OBSIDIAN_CLI = "/usr/local/bin/obsidian"
+
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
+
+
+class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer variant that binds an IPv6 sockaddr."""
+
+    address_family = socket.AF_INET6
+
+
+def resolve_loopback_bind_target(host: str, port: int) -> tuple[int, tuple]:
+    """Resolve *host* and return a sockaddr only when every result is loopback.
+
+    The resolved sockaddr is subsequently used directly for ``bind``. This
+    prevents a hostname from being checked as loopback and then resolving to a
+    different address when the HTTP server starts.
+    """
+    if not host or "\x00" in host:
+        raise ValueError("--host 必须是可解析的 loopback 地址（如 127.0.0.1、localhost 或 ::1）")
+    try:
+        results = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"--host 无法解析：{host!r}（仅允许 loopback 地址）") from exc
+
+    valid_results = []
+    rejected = []
+    for family, _socktype, _proto, _canonname, sockaddr in results:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            rejected.append(repr(sockaddr))
+            continue
+        address = sockaddr[0]
+        try:
+            is_loopback = ipaddress.ip_address(address).is_loopback
+        except ValueError:
+            is_loopback = False
+        if is_loopback:
+            valid_results.append((family, sockaddr))
+        else:
+            rejected.append(address)
+
+    if not valid_results or rejected:
+        resolved = ", ".join(rejected) or "无有效地址"
+        raise ValueError(
+            f"拒绝监听非 loopback 地址：{host!r} 解析为 {resolved}；"
+            "仅允许 127.0.0.1、localhost、::1 或其他纯 loopback 地址"
+        )
+    return valid_results[0]
+
+
+def create_loopback_server(family: int, sockaddr: tuple) -> ThreadingHTTPServer:
+    """Create an HTTP server for an already-validated loopback sockaddr."""
+    server_class = IPv6ThreadingHTTPServer if family == socket.AF_INET6 else ThreadingHTTPServer
+    return server_class(sockaddr, Handler)
+
+
+def run_script(name: str, *args: str, timeout: int = 60) -> tuple[str, int]:
+    try:
+        r = subprocess.run(
+            ["bash", f"{HUB}/scripts/{name}", *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"错误: 执行超时（>{timeout}s）: {name}", 504
+    except Exception as e:
+        return f"错误: {type(e).__name__}: {e}", 500
+    out = (r.stdout or "").strip()
+    if r.returncode != 0:
+        return (out + f"\n[exit {r.returncode}] {r.stderr.strip() or ''}").strip() or f"错误(exit {r.returncode})", 500
+    return out or "（无输出）", 200
+
+
+# ---------- 管理 API 辅助 ----------
+
+def parse_frontmatter(text: str) -> dict:
+    """解析 markdown frontmatter；优先 pyyaml，缺失时用迷你解析器（标量 + dash 列表）。"""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    block = text[3:end]
+    if yaml:
+        try:
+            data = yaml.safe_load(block)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    meta: dict = {}
+    key = ""
+    for line in block.splitlines():
+        if line.startswith("  - ") and key:
+            meta.setdefault(key, []).append(line[4:].strip().strip("'\""))
+        elif ":" in line and not line.startswith((" ", "\t")):
+            k, _, v = line.partition(":")
+            key = k.strip()
+            v = v.strip().strip("'\"")
+            meta[key] = v if v else []
+    return meta
+
+
+# rel_path -> (mtime, size, meta)；页面扫描缓存，按 mtime+size 失效
+_PAGE_CACHE: dict = {}
+
+
+def scan_pages() -> list:
+    """遍历 wiki 全部 .md（排除 raw/_archive/_legacy-para），返回元数据列表，按 updated 新→旧。"""
+    items = []
+    for root, dirs, files in os.walk(WIKI):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        for fn in files:
+            if not fn.endswith(".md") or fn.endswith(".bak"):
+                continue
+            full = os.path.join(root, fn)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            rel = os.path.relpath(full, WIKI)
+            cached = _PAGE_CACHE.get(rel)
+            if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                meta = cached[2]
+            else:
+                try:
+                    with open(full, encoding="utf-8", errors="replace") as f:
+                        meta = parse_frontmatter(f.read(8192))
+                except OSError:
+                    continue
+                _PAGE_CACHE[rel] = (st.st_mtime, st.st_size, meta)
+            if str(meta.get("status") or "") == "rejected":
+                continue
+            tags = meta.get("tags") or []
+            if isinstance(tags, str):
+                tags = [tags]
+            items.append({
+                "path": rel,
+                "title": str(meta.get("title") or fn[:-3]),
+                "type": str(meta.get("type") or os.path.dirname(rel) or "note"),
+                "tags": [str(t) for t in tags],
+                "updated": str(meta.get("updated") or ""),
+                "abstract": str(meta.get("abstract") or ""),
+                "status": str(meta.get("status") or "active"),
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+            })
+    items.sort(key=lambda x: (x["updated"], x["mtime"]), reverse=True)
+    return items
+
+
+def safe_wiki_path(rel: str):
+    """把相对路径限制在 WIKI 内且必须是 .md，防路径穿越。"""
+    if not rel or "\x00" in rel or rel.startswith(("/", "~")):
+        return None
+    base = os.path.realpath(WIKI)
+    full = os.path.realpath(os.path.join(base, rel))
+    if full.startswith(base + os.sep) and full.endswith(".md"):
+        return full
+    return None
+
+
+def _staging_candidates() -> list:
+    """staging/pages 下 status: candidate 的页面（待审池来源 a）。"""
+    items = []
+    try:
+        names = sorted(os.listdir(os.path.join(STAGING, "pages")))
+    except OSError:
+        return []
+    for fn in names:
+        if not fn.endswith(".md"):
+            continue
+        full = os.path.join(STAGING, "pages", fn)
+        if not os.path.isfile(full):
+            continue
+        try:
+            with open(full, encoding="utf-8", errors="replace") as f:
+                meta = parse_frontmatter(f.read(65536))
+        except OSError:
+            continue
+        if str(meta.get("status") or "") != "candidate":
+            continue
+        try:
+            created = time.strftime("%Y-%m-%dT%H:%M:%S",
+                                    time.localtime(os.stat(full).st_mtime))
+        except OSError:
+            created = ""
+        items.append({"source": "candidate", "id": fn, "version": _file_version(full),
+                      "title": str(meta.get("title") or fn[:-3]),
+                      "abstract": str(meta.get("abstract") or "")[:300],
+                      "created": str(meta.get("created") or created)})
+    return items
+
+
+def _experience_review_items() -> list:
+    """experience 待审条目（来源 b）：只取当前 revision 且事件 active 的行。
+
+    驳回（revoke）会新建 revision 并把事件置 revoked，旧 revision 的
+    review_required=1 标记会保留，因此必须联结 experience_events 当前
+    revision + status='active'，否则已驳回条目永远赖在待审池（M6 评审 #4）。
+    """
+    items = []
+    try:
+        if not os.path.isfile(EXPERIENCE_DB):
+            return []
+        with sqlite3.connect(EXPERIENCE_DB, timeout=5) as conn:
+            rows = conn.execute(
+                "SELECT v.event_id FROM experience_versions v "
+                "JOIN experience_events e ON e.event_id=v.event_id "
+                "AND e.revision=v.revision "
+                "WHERE v.review_required=1 AND e.status='active' "
+                "ORDER BY v.event_id").fetchall()
+            for (event_id,) in rows:
+                prow = conn.execute(
+                    "SELECT payload_json FROM experience_versions "
+                    "JOIN experience_events e ON e.event_id=experience_versions.event_id "
+                    "AND e.revision=experience_versions.revision "
+                    "WHERE experience_versions.event_id=?",
+                    (event_id,)).fetchone()
+                erow = conn.execute(
+                    "SELECT created_at FROM experience_events WHERE event_id=?",
+                    (event_id,)).fetchone()
+                title, abstract = event_id, ""
+                if prow and prow[0]:
+                    try:
+                        pay = json.loads(prow[0])
+                        title = str(pay.get("goal") or event_id)
+                        abstract = str(pay.get("narrative") or "")[:300]
+                    except ValueError:
+                        pass
+                items.append({"source": "experience", "id": event_id,
+                              "version": _experience_version(event_id),
+                              "title": title, "abstract": abstract,
+                              "created": (erow[0] if erow and erow[0] else "")})
+    except (sqlite3.Error, OSError):
+        return []
+    return items
+
+
+def api_pending() -> dict:
+    """待审池并集：staging candidate + experience review + wiki candidate 页。"""
+    items = _staging_candidates() + _experience_review_items()
+    for p in scan_pages():
+        if p.get("status") == "candidate":
+            items.append({"source": "page", "id": p["path"], "title": p["title"],
+                          "version": _file_version(safe_wiki_path(p["path"]) or ""),
+                          "abstract": p.get("abstract") or "",
+                          "created": p.get("updated") or ""})
+    return {"items": items, "total": len(items)}
+
+
+def api_overview() -> dict:
+    pages = scan_pages()
+    by_type: dict = {}
+    for p in pages:
+        by_type[p["type"]] = by_type.get(p["type"], 0) + 1
+    obs_files = sorted(glob.glob(os.path.join(STAGING, "observations-*.jsonl")),
+                       key=os.path.getmtime, reverse=True)
+    obs_lines = 0
+    for f in obs_files:
+        try:
+            with open(f, "rb") as fh:
+                obs_lines += sum(1 for _ in fh)
+        except OSError:
+            pass
+    last_capture_age = None
+    if obs_files:
+        last_capture_age = int(time.time() - os.path.getmtime(obs_files[0]))
+    db = os.path.join(DATA_DIR, "index.db")
+    db_bytes = os.path.getsize(db) if os.path.isfile(db) else 0
+    sessions_recent = 0
+    cutoff = time.time() - 3 * 86400
+    for root, _dirs, files in os.walk(SESSIONS_DIR):
+        for fn in files:
+            if fn.endswith(".jsonl"):
+                try:
+                    if os.path.getmtime(os.path.join(root, fn)) >= cutoff:
+                        sessions_recent += 1
+                except OSError:
+                    pass
+    timings: dict = {}
+    tsv = os.path.join(DATA_DIR, "timings.tsv")
+    if os.path.isfile(tsv):
+        try:
+            with open(tsv, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) >= 3:
+                        t = timings.setdefault(parts[1], {"count": 0, "total_ms": 0.0, "last_ms": 0.0})
+                        t["count"] += 1
+                        t["total_ms"] += float(parts[2])
+                        t["last_ms"] = float(parts[2])
+        except (OSError, ValueError):
+            pass
+    operation = None
+    try:
+        with open(os.path.join(DATA_DIR, "reports", "latest-operation.json"), encoding="utf-8") as stream:
+            operation = json.load(stream)
+    except (OSError, ValueError):
+        pass
+    index_path = os.path.join(DATA_DIR, "index.db")
+    # 待审统计与 /api/pending 同源：总数 + 按来源细分（M6 评审 #7）
+    _pend_items = api_pending()["items"]
+    _pend_by_source: dict = {}
+    for _it in _pend_items:
+        _pend_by_source[_it["source"]] = _pend_by_source.get(_it["source"], 0) + 1
+    return {
+        "last_operation": operation,
+        "index_updated_at": os.path.getmtime(index_path) if os.path.isfile(index_path) else None,
+        "pending_candidates": len(_pend_items),
+        "pending_details": {"candidates": _pend_by_source.get("candidate", 0),
+                            "experience_review": _pend_by_source.get("experience", 0),
+                            "pages": _pend_by_source.get("page", 0)},
+        "wiki_pages": len(pages),
+        "by_type": dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
+        "observations_files": len(obs_files),
+        "observations_lines": obs_lines,
+        "last_capture_age_seconds": last_capture_age,
+        "index_db_bytes": db_bytes,
+        "sessions_recent": sessions_recent,
+        "timings": timings,
+    }
+
+
+def _recent_sessions() -> tuple[int, dict | None]:
+    """近 3 天 .jsonl 会话数 + 最新文件信息。"""
+    count = 0
+    latest_mtime = -1
+    latest_path = ""
+    cutoff = time.time() - 3 * 86400
+    try:
+        for root, _dirs, files in os.walk(SESSIONS_DIR):
+            for fn in files:
+                if not fn.endswith(".jsonl"):
+                    continue
+                full = os.path.join(root, fn)
+                try:
+                    m = os.path.getmtime(full)
+                except OSError:
+                    continue
+                if m >= cutoff:
+                    count += 1
+                if m > latest_mtime:
+                    latest_mtime = m
+                    latest_path = os.path.relpath(full, SESSIONS_DIR)
+    except OSError:
+        pass
+    if not latest_path:
+        return count, None
+    return count, {
+        "file": latest_path,
+        "age_seconds": int(time.time() - latest_mtime),
+    }
+
+
+def _sqlite_count(path: str, table: str) -> int:
+    try:
+        import sqlite3  # stdlib
+        with sqlite3.connect(path, timeout=5) as conn:
+            row = conn.execute(f"SELECT COUNT(*) FROM [{table}]").fetchone()
+            return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+def _llm_proxy_reachable() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", 10100), timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+
+def _collect_realtime_lines(obs_files: list) -> int:
+    lines = 0
+    rt = os.path.join(STAGING, "observations-realtime.jsonl")
+    if rt in obs_files:
+        try:
+            with open(rt, "rb") as fh:
+                lines = sum(1 for _ in fh)
+        except OSError:
+            pass
+    return lines
+
+
+def _wiki_recent_pages(n: int = 5) -> list:
+    """wiki 最近 mtime 更新的 .md 页面（排除 .obsidian 与 EXCLUDE_DIRS）。"""
+    items: list = []
+    try:
+        for root, dirs, files in os.walk(WIKI):
+            dirs[:] = [d for d in dirs
+                       if d not in EXCLUDE_DIRS and d != ".obsidian"]
+            for fn in files:
+                if not fn.endswith(".md") or fn.endswith(".bak"):
+                    continue
+                full = os.path.join(root, fn)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                rel = os.path.relpath(full, WIKI)
+                items.append({"path": rel, "mtime": int(st.st_mtime)})
+    except OSError:
+        return []
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return items[:n]
+
+
+def api_vitals() -> dict:
+    """供管理面板「状态」页图像化使用的聚合指标（stdlib only）。"""
+    pages = scan_pages()
+    obs_files = sorted(glob.glob(os.path.join(STAGING, "observations-*.jsonl")),
+                       key=os.path.getmtime, reverse=True)
+
+    sessions_recent, latest_session = _recent_sessions()
+    last_capture_age = None
+    if obs_files:
+        last_capture_age = int(time.time() - os.path.getmtime(obs_files[0]))
+
+    db_bytes = 0
+    db = os.path.join(DATA_DIR, "index.db")
+    if os.path.isfile(db):
+        try:
+            db_bytes = os.path.getsize(db)
+        except OSError:
+            db_bytes = 0
+
+    claude_mem_rows = 0
+    cm = os.path.expanduser("~/.claude-mem/data/claude-mem.db")
+    if os.path.isfile(cm):
+        claude_mem_rows = _sqlite_count(cm, "observations")
+
+    timings: dict = {}
+    tsv = os.path.join(DATA_DIR, "timings.tsv")
+    if os.path.isfile(tsv):
+        try:
+            with open(tsv, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) >= 3:
+                        t = timings.setdefault(parts[1],
+                                               {"count": 0, "total_ms": 0.0, "last_ms": 0.0})
+                        t["count"] += 1
+                        t["total_ms"] += float(parts[2])
+                        t["last_ms"] = float(parts[2])
+        except (OSError, ValueError):
+            pass
+
+    return {
+        "llm_proxy": _llm_proxy_reachable(),
+        "claude_mem_rows": int(claude_mem_rows),
+        "sessions_recent": int(sessions_recent),
+        "latest_session": latest_session,
+        "obs_files": len(obs_files),
+        "realtime_lines": _collect_realtime_lines(obs_files),
+        "wiki_pages": len(pages),
+        "index_db_bytes": int(db_bytes),
+        "last_capture_age_seconds": last_capture_age,
+        "timings": timings,
+        "recent_pages": _wiki_recent_pages(5),
+    }
+
+
+def api_pages(q: dict) -> dict:
+    first = lambda k, d="": (q.get(k, [d])[0] or d)
+    ftype, ftag, fq = first("type"), first("tag"), first("q").lower()
+    fdir = first("dir")
+    try:
+        offset = max(0, int(first("offset", "0")))
+        limit = min(200, max(1, int(first("limit", "50"))))
+    except ValueError:
+        offset, limit = 0, 50
+    items = scan_pages()
+    if fdir:
+        items = [p for p in items if (os.path.dirname(p["path"]) or ".") == fdir]
+    if ftype:
+        items = [p for p in items if p["type"] == ftype]
+    if ftag:
+        items = [p for p in items if ftag in p["tags"]]
+    if fq:
+        items = [p for p in items
+                 if fq in p["title"].lower() or fq in p["abstract"].lower()
+                 or fq in p["path"].lower() or any(fq in t.lower() for t in p["tags"])]
+    total = len(items)
+    return {"total": total, "offset": offset, "limit": limit,
+            "items": items[offset:offset + limit]}
+
+
+def api_tree() -> dict:
+    """vault 目录树（对齐 Obsidian 文件管理器）：每个目录的页面数。"""
+    counts: dict = {}
+    for p in scan_pages():
+        d = os.path.dirname(p["path"]) or "."
+        counts[d] = counts.get(d, 0) + 1
+    folders = [{"dir": k, "count": v} for k, v in sorted(counts.items())]
+    return {"folders": folders, "total": sum(counts.values())}
+
+
+def api_observations(q: dict) -> dict:
+    first = lambda k, d="": (q.get(k, [d])[0] or d)
+    fq, fproj = first("q").lower(), first("project")
+    try:
+        offset = max(0, int(first("offset", "0")))
+        limit = min(200, max(1, int(first("limit", "50"))))
+    except ValueError:
+        offset, limit = 0, 50
+    files = sorted(glob.glob(os.path.join(STAGING, "observations-*.jsonl")),
+                   key=os.path.getmtime, reverse=True)
+    out, skipped = [], 0
+    for f in files:
+        if len(out) > limit:
+            break
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for line in reversed(lines):  # 文件内也是新→旧
+            try:
+                ob = json.loads(line)
+            except ValueError:
+                continue
+            if fproj and ob.get("project") != fproj:
+                continue
+            text = str(ob.get("text") or "")
+            if fq and fq not in text.lower():
+                continue
+            if skipped < offset:
+                skipped += 1
+                continue
+            out.append({
+                "project": ob.get("project"),
+                "role": ob.get("role"), "type": ob.get("type"),
+                "created_at": ob.get("created_at"), "text": text[:300],
+            })
+            if len(out) > limit:
+                break
+    return {"items": out[:limit], "has_more": len(out) > limit,
+            "offset": offset, "limit": limit}
+
+
+# ---------- 调用日志（agent 可观测性）----------
+
+SKIP_LOG_PATHS = {"/health", "/", "/api/calls"}  # 健康轮询不记，减少噪音
+
+
+def access_kind(method: str, path: str) -> str:
+    if path == "/search":
+        return "search"
+    if path == "/ask":
+        return "ask"
+    if path == "/api/page":
+        return {"GET": "page-read", "POST": "page-write", "DELETE": "page-delete"}.get(method, "page")
+    if path.startswith("/api/"):
+        return path[5:]
+    return path.strip("/") or "root"
+
+
+_RESULT_PATH_RE = re.compile(r"^\[[^\]]*\]\s+(\S+?\.md)\s*$", re.M)
+
+
+def extract_md_refs(text: str, limit: int = 8) -> list:
+    """从 search/ask 脚本输出里解析命中的 wiki 页面路径。"""
+    out = []
+    for m in _RESULT_PATH_RE.finditer(text or ""):
+        p = m.group(1)
+        if p not in out:
+            out.append(p)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def log_access(method: str, path: str, query: str, status: int, ms: float,
+               refs: list = None) -> None:
+    if path in SKIP_LOG_PATHS:
+        return
+    try:
+        if os.path.isfile(ACCESS_LOG) and os.path.getsize(ACCESS_LOG) > ACCESS_MAX:
+            os.replace(ACCESS_LOG, ACCESS_LOG + ".1")
+        os.makedirs(DATA_DIR, exist_ok=True)
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "src": "rest",
+            "m": method,
+            "kind": access_kind(method, path),
+            "q": query[:160],
+            "status": status,
+            "ms": round(ms, 1),
+        }
+        if refs:
+            row["refs"] = refs[:8]
+        with open(ACCESS_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def access_hot_map() -> dict:
+    """聚合 access.jsonl 里的 refs → {页面路径: agent 调用次数}（图谱热度层）。"""
+    hot: dict = {}
+    for f in (ACCESS_LOG + ".1", ACCESS_LOG):
+        if not os.path.isfile(f):
+            continue
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    for r in row.get("refs") or []:
+                        hot[r] = hot.get(r, 0) + 1
+        except OSError:
+            continue
+    return hot
+
+
+def api_calls(q: dict) -> dict:
+    first = lambda k, d="": (q.get(k, [d])[0] or d)
+    fkind = first("kind")
+    try:
+        offset = max(0, int(first("offset", "0")))
+        limit = min(200, max(1, int(first("limit", "50"))))
+    except ValueError:
+        offset, limit = 0, 50
+    rows = []
+    for f in (ACCESS_LOG + ".1", ACCESS_LOG):
+        if not os.path.isfile(f):
+            continue
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        continue
+        except OSError:
+            continue
+    rows.reverse()  # 新→旧（.1 旧文件在前、主文件在后，整体反转即最新优先）
+    if fkind:
+        rows = [r for r in rows if r.get("kind") == fkind or
+                (fkind == "mcp" and str(r.get("src")) == "mcp")]
+    total = len(rows)
+    return {"total": total, "offset": offset, "limit": limit,
+            "items": rows[offset:offset + limit]}
+
+
+# ---------- 图谱（Obsidian 风格 [[wikilink]] 关系图）----------
+
+_LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+_LINKS_CACHE: dict = {}  # rel -> (mtime, size, [targets])
+
+
+def page_links(rel: str, st) -> list:
+    cached = _LINKS_CACHE.get(rel)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
+    try:
+        with open(os.path.join(WIKI, rel), encoding="utf-8", errors="replace") as f:
+            body = f.read()
+    except OSError:
+        return []
+    targets = [m.group(1).strip() for m in _LINK_RE.finditer(body)]
+    _LINKS_CACHE[rel] = (st.st_mtime, st.st_size, targets)
+    return targets
+
+
+def obsidian_graph_shot():
+    """激活运行中 Obsidian 的图谱视图并截屏。返回 (png_bytes, err)。"""
+    if not os.path.isfile(OBSIDIAN_CLI):
+        return None, "obsidian CLI 不存在（/usr/local/bin/obsidian）"
+    vault = os.path.basename(os.path.realpath(WIKI))
+
+    def _eval(code: str) -> None:
+        try:
+            subprocess.run([OBSIDIAN_CLI, "eval", f"code={code}"],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+    try:
+        # 尽力让图谱视图前置（Obsidian 未运行时此调用会失败，忽略）
+        subprocess.run([OBSIDIAN_CLI, "command", "id=graph:open", f"vault={vault}"],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+    # 收起左右侧栏，让截图只剩纯图谱；截完在 finally 里恢复
+    _eval('app.workspace.leftSplit.collapse(); app.workspace.rightSplit.collapse(); "ok"')
+    time.sleep(1.2)  # 等视图切换与力导向渲染
+    tmpdir = tempfile.gettempdir()
+    before = set(glob.glob(os.path.join(tmpdir, "obsidian-screenshot-*")))
+    try:
+        r = subprocess.run([OBSIDIAN_CLI, "dev:screenshot"],
+                           capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        return None, f"截图失败：{type(e).__name__}: {e}"
+    finally:
+        _eval('app.workspace.leftSplit.expand(); app.workspace.rightSplit.expand(); "ok"')
+    path = (r.stdout or "").strip()
+    if not os.path.isfile(path):
+        new = sorted(set(glob.glob(os.path.join(tmpdir, "obsidian-screenshot-*"))) - before,
+                     key=os.path.getmtime, reverse=True)
+        path = new[0] if new else ""
+    if not path or not os.path.isfile(path):
+        return None, "未找到截图输出（Obsidian 是否在运行？）"
+    try:
+        with open(path, "rb") as f:
+            return f.read(), None
+    except OSError as e:
+        return None, f"读取截图失败：{e}"
+
+
+def api_graph(include_atoms: bool) -> dict:
+    pages = scan_pages()
+    by_stem = {p["path"][:-3]: p for p in pages if p["path"].endswith(".md")}
+    by_name: dict = {}
+    for p in pages:
+        if p["path"].endswith(".md"):
+            by_name.setdefault(os.path.basename(p["path"])[:-3], p)
+        if p["title"]:
+            by_name.setdefault(p["title"], p)
+    nodes, ids = [], set()
+    hot = access_hot_map()
+    for p in pages:
+        if not include_atoms and p["type"] == "atom":
+            continue
+        ids.add(p["path"])
+        nodes.append({"id": p["path"], "title": p["title"], "type": p["type"],
+                      "size": p["size"], "hot": hot.get(p["path"], 0)})
+    edges, seen = [], set()
+    for p in pages:
+        src = p["path"]
+        if src not in ids:
+            continue
+        try:
+            st = os.stat(os.path.join(WIKI, src))
+        except OSError:
+            continue
+        for t in page_links(src, st):
+            tgt = by_stem.get(t) or by_name.get(t)
+            if not tgt or tgt["path"] == src or tgt["path"] not in ids:
+                continue
+            key = (src, tgt["path"])
+            if key not in seen:
+                seen.add(key)
+                edges.append({"source": src, "target": tgt["path"]})
+    if include_atoms:
+        # atom 只保留有连线的；3000+ 个孤立 atom 会把图谱变成噪点
+        linked = {e["source"] for e in edges} | {e["target"] for e in edges}
+        nodes = [n for n in nodes if n["type"] != "atom" or n["id"] in linked]
+    # 对齐 vault 的 .obsidian/graph.json 配置：showTags 时把标签渲染为节点（与 Obsidian 图谱一致）
+    obs_cfg: dict = {}
+    try:
+        with open(os.path.join(WIKI, ".obsidian", "graph.json"), encoding="utf-8") as f:
+            obs_cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    show_tags = bool(obs_cfg.get("showTags"))
+    if show_tags:
+        by_id = {n["id"]: n for n in nodes}
+        tag_nodes: dict = {}
+        for p in pages:
+            if p["path"] not in by_id:
+                continue
+            for t in p["tags"]:
+                tid = "tag:" + t
+                if tid not in tag_nodes:
+                    tag_nodes[tid] = {"id": tid, "title": "#" + t,
+                                      "type": "tag", "size": 0, "hot": 0}
+                key = (p["path"], tid)
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"source": p["path"], "target": tid})
+        nodes.extend(tag_nodes.values())
+    return {"nodes": nodes, "edges": edges,
+            "obsidian": {"showTags": show_tags,
+                         "hideUnresolved": bool(obs_cfg.get("hideUnresolved")),
+                         "showOrphans": bool(obs_cfg.get("showOrphans"))}}
+
+def _file_version(path):
+    """文件内容 sha256；文件不存在返回 None。"""
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _experience_version(event_id):
+    """experience 条目版本：当前 revision + status；条目不存在返回 None。"""
+    try:
+        if not os.path.isfile(EXPERIENCE_DB):
+            return None
+        with sqlite3.connect(f"file:{EXPERIENCE_DB}?mode=ro", uri=True, timeout=5) as conn:
+            row = conn.execute("SELECT revision, status FROM experience_events WHERE event_id=?",
+                               (event_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return f"exp:{row[0]}:{row[1]}" if row else None
+
+
+def _review_version_conflict(payload, path=None, current=None):
+    """version 与当前版本不一致时返回 409 响应体，否则 None（必填性由调用方先校验）。"""
+    want = payload.get("version")
+    cur = _file_version(path) if path is not None else current
+    if cur is None:
+        return None  # 不存在的情况交给后续 404 处理
+    if str(want) != cur:
+        return {"error": "版本冲突：文件已被修改", "code": "version_conflict",
+                "expected": str(want), "current": cur}
+    return None
+
+
+def _git_commit_paths(repo, rels, message):
+    """仅暂存并提交 rels；repo 不是 git 仓库时返回 None。绝不 add -A。"""
+    chk = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo,
+                         capture_output=True, text=True)
+    if chk.returncode != 0:
+        return None
+    top = chk.stdout.strip()
+    paths = [os.path.relpath(os.path.join(repo, r), top) for r in rels]
+    for args in (["add", "--", *paths],
+                 ["commit", "-m", message, "--only", "--", *paths]):
+        r = subprocess.run(["git", *args], cwd=top, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip()[-500:])
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=top,
+                          capture_output=True, text=True).stdout.strip()
+
+
+NOTION_SYNC_DB = os.environ.get("MEMORY_HUB_NOTION_SYNC_DB",
+                                os.path.join(DATA_DIR, "notion-sync.sqlite3"))
+
+
+def _review_enqueue(source, rid, decision, version, object_type, object_id, extra=None):
+    """审批成功后把结果幂等写入 outbox（Notion 单向投影的唯一入口）。
+
+    idempotency_key = sha256(review|source|id|decision|version)：同一版本上的同一审批
+    重复提交只会入队一次。库不存在时按 migration 机制创建（migrate 幂等）。
+    """
+    import hashlib
+    from scripts.automation_core.notion_sync import migrations as _nsm
+    key = hashlib.sha256("|".join(("review", source, rid, decision, str(version)))
+                         .encode("utf-8")).hexdigest()
+    body = {"source": source, "id": rid, "decision": decision, "version": str(version),
+            "status": "active" if decision == "approve" else "rejected"}
+    body.update(extra or {})
+    _nsm.migrate(pathlib.Path(NOTION_SYNC_DB))
+    conn = sqlite3.connect(NOTION_SYNC_DB, timeout=10)
+    try:
+        with conn:
+            inserted = _nsm.enqueue(conn, key, object_type, object_id,
+                                    "review." + ("approved" if decision == "approve" else "rejected"),
+                                    json.dumps(body, ensure_ascii=False, sort_keys=True))
+    finally:
+        conn.close()
+    return {"idempotency_key": key, "inserted": inserted}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _trusted_request(self):
+        try:
+            host = urlparse("http://" + self.headers.get("Host", ""))
+            valid_host = host.hostname == "localhost" or ipaddress.ip_address(host.hostname).is_loopback
+            if not valid_host or host.port != self.server.server_port:
+                return False
+        except (ValueError, TypeError):
+            return False
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True  # Non-browser local API clients.
+        if origin == "http://" + self.headers.get("Host", ""):
+            return True
+        allowed = {x.strip() for x in os.environ.get("MEMORY_HUB_ALLOWED_ORIGINS", "").split(",") if x.strip() and x.strip() not in ("*", "null")}
+        return origin in allowed
+
+    # send_response 包一层以捕获状态码，供访问日志使用
+    def send_response(self, code, message=None):
+        self._mh_status = code
+        super().send_response(code, message)
+
+    def _with_log(self, method: str, fn):
+        t0 = time.time()
+        self._mh_refs = None
+        try:
+            if not self._trusted_request():
+                return self._json({"error": "untrusted host or origin"}, 403)
+            fn()
+        finally:
+            u = urlparse(self.path)
+            log_access(method, u.path, u.query,
+                       getattr(self, "_mh_status", 0),
+                       (time.time() - t0) * 1000,
+                       refs=self._mh_refs)
+
+    def do_GET(self):
+        self._with_log("GET", self._do_GET)
+
+    def do_POST(self):
+        self._with_log("POST", self._do_POST)
+
+    def do_DELETE(self):
+        self._with_log("DELETE", self._do_DELETE)
+
+    def _do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        first = lambda k, d="": (q.get(k, [d])[0] or d)
+
+        if u.path == "/health":
+            return self._json({"status": "ok"})
+        if u.path == "/dashboard.css":
+            with open(os.path.join(HUB, "ui", "dashboard.css"), encoding="utf-8") as stylesheet:
+                return self._text(stylesheet.read(), 200, "text/css; charset=utf-8")
+        if u.path in ("/", "/dashboard", "/ui"):
+            accept = self.headers.get("Accept", "")
+            if first("format") == "json" or ("application/json" in accept and "text/html" not in accept):
+                return self._json({
+                    "name": "memory-hub REST",
+                    "ui": "http://127.0.0.1:8787/",
+                    "endpoints": ["/health", "/status", "/search?q=&top=", "/ask?q=", "/metrics",
+                                  "/api/vitals", "/api/overview", "/api/pages", "/api/page", "/api/tags",
+                                  "/api/observations"],
+                })
+            dash_path = os.path.join(HUB, "ui", "dashboard.html")
+            if os.path.isfile(dash_path):
+                with open(dash_path, "r", encoding="utf-8") as f:
+                    return self._text(f.read(), 200, "text/html; charset=utf-8")
+            return self._json({"status": "ok"})
+        if u.path == "/status":
+            return self._text(*run_script("status.sh", timeout=20))
+        if u.path == "/search":
+            q_text = first("q") or first("query")
+            if not q_text:
+                return self._json({"error": "missing query parameter"}, 400)
+            if len(q_text) > 500:
+                return self._json({"error": "query exceeds 500 characters"}, 400)
+            scope = first("scope") or None
+            if scope and scope not in ("user", "project", "agent"):
+                return self._json({"error": "invalid scope"}, 400)
+            scope_id = first("scope_id") or None
+            try:
+                top_val = int(first("top", "10"))
+                top_val = max(1, min(top_val, 50))
+            except ValueError:
+                return self._json({"error": "invalid top parameter"}, 400)
+            expand = first("expand", "1").lower() in ("1", "true", "yes")
+            fuse = first("fuse", "1").lower() in ("1", "true", "yes")
+            explain = first("explain", "0").lower() in ("1", "true", "yes")
+
+            service = MemoryService(pathlib.Path(WIKI), pathlib.Path(DATA_DIR), pathlib.Path(HUB))
+            request = SearchRequest(
+                query=q_text,
+                top=top_val,
+                fuse=fuse,
+                expand=expand,
+                scope=scope,
+                scope_id=scope_id,
+                explain=explain,
+            )
+            resp = service.search(request)
+            self._mh_refs = [r.path for r in resp.results]
+            return self._json(resp.to_dict(), 200)
+
+        if u.path == "/ask":
+            q_text = first("q") or first("question")
+            if not q_text:
+                return self._json({"error": "missing question parameter"}, 400)
+            if len(q_text) > 500:
+                return self._json({"error": "question exceeds 500 characters"}, 400)
+            scope = first("scope") or None
+            if scope and scope not in ("user", "project", "agent"):
+                return self._json({"error": "invalid scope"}, 400)
+            scope_id = first("scope_id") or None
+            try:
+                top_val = int(first("top", "5"))
+                top_val = max(1, min(top_val, 50))
+            except ValueError:
+                return self._json({"error": "invalid top parameter"}, 400)
+            expand = first("expand", "1").lower() in ("1", "true", "yes")
+            fuse = first("fuse", "1").lower() in ("1", "true", "yes")
+            explain = first("explain", "0").lower() in ("1", "true", "yes")
+
+            service = MemoryService(pathlib.Path(WIKI), pathlib.Path(DATA_DIR), pathlib.Path(HUB))
+            request = SearchRequest(
+                query=q_text,
+                top=top_val,
+                fuse=fuse,
+                expand=expand,
+                scope=scope,
+                scope_id=scope_id,
+                explain=explain,
+            )
+            ctx = service.ask_context(request)
+            self._mh_refs = [r.path for r in ctx.results]
+            return self._json(ctx.to_dict(), 200)
+        if u.path == "/metrics":
+            return self._text(*run_script("metrics.sh", timeout=20))
+        # ----- 管理 API（JSON）-----
+        if u.path == "/api/overview":
+            return self._json(api_overview())
+        if u.path == "/api/vitals":
+            return self._json(api_vitals())
+        if u.path == "/api/pages":
+            return self._json(api_pages(q))
+        if u.path == "/api/tree":
+            return self._json(api_tree())
+        if u.path == "/api/page":
+            full = safe_wiki_path(first("path"))
+            if not full or not os.path.isfile(full):
+                return self._json({"error": "页面不存在或路径非法"}, 404)
+            try:
+                with open(full, encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError as e:
+                return self._json({"error": f"读取失败: {e}"}, 500)
+            rel = os.path.relpath(full, os.path.realpath(WIKI))
+            return self._json({"path": rel, "content": content,
+                               "meta": parse_frontmatter(content)})
+        if u.path == "/api/tags":
+            counts: dict = {}
+            for p in scan_pages():
+                for t in p["tags"]:
+                    counts[t] = counts.get(t, 0) + 1
+            tags = [{"tag": k, "count": v}
+                    for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+            return self._json({"tags": tags, "total": len(tags)})
+        if u.path == "/api/observations":
+            return self._json(api_observations(q))
+        if u.path == "/api/calls":
+            return self._json(api_calls(q))
+        if u.path == "/api/graph":
+            return self._json(api_graph(first("include_atoms") in ("1", "true", "yes")))
+        if u.path == "/api/pending":
+            return self._json(api_pending())
+        if u.path == "/api/obsidian/graph-shot":
+            png, err = obsidian_graph_shot()
+            if err:
+                return self._json({"error": err}, 503)
+            return self._bin(png, "image/png")
+        self._json({"error": "not found"}, 404)
+
+    def _do_review(self, payload: dict):
+        """POST /api/review {source, id, decision, version?}：持 automation.lock 后执行审批。
+
+        - 写前获取 DATA_DIR/locks/automation.lock（沿用 AutomationLock）；被占用返回 423，不写。
+        - version（可选）：目标文件当前内容 sha256；与当前不一致返回 409。
+        - page 写入成功后在 wiki git 仓库里只暂存并提交本次写入的文件。
+        """
+        from scripts.automation_core.operation import AutomationLock, LockBusy
+        from scripts.automation_core.schema import Mode, OperationContext
+        op_id = "review-" + time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + f"-{os.getpid()}-{threading.get_ident()}"
+        ctx = OperationContext(operation_id=op_id, command="api-review", mode=Mode.SAFE,
+                               auto=False, apply=True,
+                               wiki_path=pathlib.Path(WIKI), data_path=pathlib.Path(DATA_DIR))
+        try:
+            lock = AutomationLock.acquire(pathlib.Path(DATA_DIR), ctx)
+        except LockBusy as e:
+            return self._json({"error": f"automation.lock 被占用，未写入：{e}",
+                               "code": "lock_busy"}, 423)
+        # 先释放锁再发响应：所有返回路径（含报错/异常）都先缓存响应，释放后再写出。
+        pending = []
+        send = self._json
+        self._json = lambda obj, code=200: pending.append((obj, code))
+        try:
+            self._do_review_locked(payload)
+        except Exception as e:
+            pending[:] = [({"error": f"审批失败: {e}"}, 500)]
+        finally:
+            del self._json
+            lock.release()
+        obj, code = pending[-1] if pending else ({"error": "无响应"}, 500)
+        return send(obj, code)
+
+    def _do_review_locked(self, payload: dict):
+        """POST /api/review {source, id, decision}：待审池审批/驳回。"""
+        source = str(payload.get("source") or "")
+        rid = str(payload.get("id") or "")
+        decision = str(payload.get("decision") or "")
+        if source not in ("candidate", "experience", "page") \
+                or decision not in ("approve", "reject"):
+            return self._json({"error": "参数非法：source=candidate|experience|page，decision=approve|reject"}, 400)
+        version = payload.get("version")
+        if not isinstance(version, str) or not version:
+            return self._json({"error": "缺少 version：请先从 /api/pending 取当前版本", "code": "version_required"}, 400)
+
+        def _outbox(object_type, object_id, extra=None):
+            try:
+                return _review_enqueue(source, rid, decision, version, object_type, object_id, extra), None
+            except Exception as e:  # 已写入但未入队：显式报错，不吞
+                return None, {"error": f"已写入但 outbox 入队失败: {e}", "id": rid}
+        if source == "candidate":
+            if not re.fullmatch(r"[^/]+\.md", rid):
+                return self._json({"error": "candidate id 非法：须为 staging/pages 下的 .md 文件名"}, 400)
+            _vc = _review_version_conflict(payload, os.path.join(STAGING, "pages", rid))
+            if _vc:
+                return self._json(_vc, 409)
+            if decision == "approve":
+                try:
+                    r = subprocess.run(
+                        ["bash", f"{HUB}/scripts/publish.sh", "--apply",
+                         "--accept-candidate", rid],
+                        capture_output=True, text=True, timeout=120)
+                except subprocess.TimeoutExpired:
+                    return self._json({"error": "publish.sh 执行超时"}, 504)
+                except Exception as e:
+                    return self._json({"error": f"执行失败: {e}"}, 500)
+                if r.returncode != 0:
+                    err = (r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}")
+                    return self._json({"error": err}, 500)
+                # publish.sh 成功返回不等于指定页实际发布：校验 staging 已移走、
+                # published 落盘、wiki 目标存在，否则报 500 而不是 200（M6 评审 #2）
+                pub = os.path.join(STAGING, "published", rid)
+                still = os.path.join(STAGING, "pages", rid)
+                if os.path.isfile(still) or not os.path.isfile(pub):
+                    return self._json({"error": "publish.sh 返回成功但指定页未实际发布"}, 500)
+                try:
+                    with open(pub, encoding="utf-8", errors="replace") as f:
+                        _head = f.read(8192)
+                    _tgt_rel = ""
+                    for _line in _head.splitlines():
+                        if _line.startswith("conflict_target:"):
+                            _tgt_rel = _line.split(":", 1)[1].strip().strip("'\"")
+                            break
+                    _tgt = safe_wiki_path(_tgt_rel) if _tgt_rel else None
+                    if not _tgt or not os.path.isfile(_tgt):
+                        return self._json({"error": "publish.sh 返回成功但 wiki 目标页不存在"}, 500)
+                    # 一次审批直接离池：发布成功后把 wiki 目标页置 active，
+                    # 不再要求二次 page approve（收口 #6）。
+                    from scripts.automation_core.frontmatter import parse_page as _parse_page
+                    from scripts.automation_core.frontmatter import patch_frontmatter as _patch_fm
+                    _doc = _parse_page(pathlib.Path(_tgt))
+                    with open(_tgt, "wb") as _fw:
+                        _fw.write(_patch_fm(_doc, {"status": "active"}))
+                except (OSError, ValueError) as e:
+                    return self._json({"error": f"发布后激活失败: {e}"}, 500)
+                _tgt_rel_real = os.path.relpath(_tgt, os.path.realpath(WIKI))
+                _PAGE_CACHE.pop(_tgt_rel_real, None)
+                ob, err = _outbox("page", _tgt_rel_real, {"candidate": rid})
+                if err is not None:
+                    return self._json(err, 500)
+                return self._json({"ok": True, "source": source, "id": rid,
+                                   "output": (r.stdout.strip() or "")[-500:], "outbox": ob})
+            src = os.path.join(STAGING, "pages", rid)
+            if not os.path.isfile(src):
+                return self._json({"error": "candidate 不存在"}, 404)
+            try:
+                # 拒绝归档永不覆盖旧记录：同名时加时间戳序号后缀（M6 评审 #3）
+                rej_dir = os.path.join(STAGING, "rejected")
+                os.makedirs(rej_dir, exist_ok=True)
+                _dest = os.path.join(rej_dir, rid)
+                if os.path.lexists(_dest):
+                    _stem, _ext = os.path.splitext(rid)
+                    _stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+                    _n = 1
+                    while os.path.lexists(_dest):
+                        _dest = os.path.join(rej_dir, f"{_stem}-{_stamp}-{_n}{_ext}")
+                        _n += 1
+                os.replace(src, _dest)
+                _moved = os.path.join("staging/rejected", os.path.basename(_dest))
+            except OSError as e:
+                return self._json({"error": f"移动失败: {e}"}, 500)
+            ob, err = _outbox("candidate", rid, {"moved": _moved})
+            if err is not None:
+                return self._json(err, 500)
+            return self._json({"ok": True, "source": source, "id": rid,
+                               "moved": _moved, "outbox": ob})
+        if source == "experience":
+            _vc = _review_version_conflict(payload, current=_experience_version(rid))
+            if _vc:
+                return self._json(_vc, 409)
+            try:
+                if decision == "approve":
+                    from scripts.automation_core.experience.store import clear_review_required
+                    res = clear_review_required(EXPERIENCE_DB, rid)
+                else:
+                    from scripts.automation_core.experience.revisions import review_revoke
+                    res = review_revoke(EXPERIENCE_DB, rid)
+            except Exception as e:
+                return self._json({"error": f"experience {decision} 失败: {e}"}, 500)
+            ob, err = _outbox("experience", rid)
+            if err is not None:
+                return self._json(err, 500)
+            return self._json({"ok": True, "source": source, "id": rid, "result": res, "outbox": ob})
+        full = safe_wiki_path(rid)
+        if not full or not os.path.isfile(full):
+            return self._json({"error": "页面不存在或路径非法"}, 404)
+        # page+approve 仅 candidate 页可转 active（离池）；page+reject 是普通 wiki
+        # 在售页的合法入口（plan 原义），任意状态页都可标记 rejected。
+        target_status = "active" if decision == "approve" else "rejected"
+        _vc = _review_version_conflict(payload, full)
+        if _vc:
+            return self._json(_vc, 409)
+        try:
+            from scripts.automation_core.frontmatter import parse_page, patch_frontmatter
+            cur = parse_page(pathlib.Path(full))
+            cur_status = str((cur.frontmatter or {}).get("status") or "active")
+            if decision == "approve" and cur_status != "candidate":
+                return self._json(
+                    {"error": f"仅 candidate 状态的 wiki 页可通过（当前 status={cur_status}）"}, 400)
+            new_bytes = patch_frontmatter(cur, {"status": target_status})
+            with open(full, "wb") as f:
+                f.write(new_bytes)
+        except (OSError, ValueError) as e:
+            return self._json({"error": f"标记 {target_status} 失败: {e}"}, 500)
+        rel = os.path.relpath(full, os.path.realpath(WIKI))
+        _PAGE_CACHE.pop(rel, None)
+        self._mh_refs = [rel]
+        try:
+            commit = _git_commit_paths(os.path.realpath(WIKI), [rel],
+                                       f"review: {decision} {rel} -> {target_status}")
+        except RuntimeError as e:
+            return self._json({"error": f"已写入但 git commit 失败: {e}", "id": rel}, 500)
+        ob, err = _outbox("page", rel, {"commit": commit})
+        if err is not None:
+            return self._json(err, 500)
+        return self._json({"ok": True, "source": source, "id": rel,
+                           "version": _file_version(full), "commit": commit, "outbox": ob})
+
+    def _do_POST(self):
+        u = urlparse(self.path)
+        if u.path == "/api/review":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > MAX_BODY:
+                return self._json({"error": "请求体过大（>2MB）"}, 413)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return self._json({"error": "JSON 解析失败"}, 400)
+            if not isinstance(payload, dict):
+                return self._json({"error": "JSON 解析失败"}, 400)
+            return self._do_review(payload)
+        if u.path == "/api/page":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > MAX_BODY:
+                return self._json({"error": "请求体过大（>2MB）"}, 413)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return self._json({"error": "JSON 解析失败"}, 400)
+            full = safe_wiki_path(str(payload.get("path") or ""))
+            if not full:
+                return self._json({"error": "路径非法：必须在 wiki 内且为 .md"}, 400)
+            content = str(payload.get("content") or "")
+            try:
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except OSError as e:
+                return self._json({"error": f"写入失败: {e}"}, 500)
+            rel = os.path.relpath(full, os.path.realpath(WIKI))
+            _PAGE_CACHE.pop(rel, None)
+            self._mh_refs = [rel]
+            return self._json({"ok": True, "bytes": len(content.encode("utf-8"))})
+        self._json({"error": "not found"}, 404)
+
+    def _do_DELETE(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if u.path == "/api/page":
+            full = safe_wiki_path((q.get("path", [""])[0] or ""))
+            if not full or not os.path.isfile(full):
+                return self._json({"error": "页面不存在或路径非法"}, 404)
+            rel = os.path.relpath(full, os.path.realpath(WIKI))
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dest = os.path.join(TRASH_DIR, f"{stamp}-{rel.replace(os.sep, '__')}")
+            try:
+                os.makedirs(TRASH_DIR, exist_ok=True)
+                os.replace(full, dest)
+            except OSError as e:
+                return self._json({"error": f"移除失败: {e}"}, 500)
+            _PAGE_CACHE.pop(rel, None)
+            self._mh_refs = [rel]
+            return self._json({"ok": True, "trash": dest,
+                               "hint": "已移入回收站（非永久删除），可从该路径恢复"})
+        self._json({"error": "not found"}, 404)
+
+    def do_OPTIONS(self):
+        if not self._trusted_request():
+            return self._json({"error": "untrusted host or origin"}, 403)
+        self.send_response(204)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _cors(self):
+        origin = self.headers.get("Origin")
+        if origin and self._trusted_request():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def _text(self, body: str, code: int = 200, ctype: str = "text/plain; charset=utf-8"):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj, code: int = 200):
+        data = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _bin(self, data: bytes, ctype: str, code: int = 200):
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        print(f"[{self.log_date_time_string()}] {fmt % args}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="memory-hub REST server")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="仅允许 loopback 地址（默认：127.0.0.1）")
+    args = ap.parse_args()
+    try:
+        family, sockaddr = resolve_loopback_bind_target(args.host, args.port)
+    except ValueError as exc:
+        ap.error(str(exc))
+    srv = create_loopback_server(family, sockaddr)
+    bound_host, bound_port = srv.server_address[:2]
+    display_host = f"[{bound_host}]" if family == socket.AF_INET6 else bound_host
+    print(f"memory-hub REST: http://{display_host}:{bound_port}  (Ctrl-C 退出)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止")
+
+
+if __name__ == "__main__":
+    main()
